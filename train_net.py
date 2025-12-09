@@ -245,7 +245,7 @@ class Trainer(DefaultTrainer):
             with apply_model_ema_and_restore(model):
                 results = cls.test(cfg, model, evaluators=evaluators)
         else:
-            pdb.set_trace()
+            # pdb.set_trace()
             results = cls.test(cfg, model, evaluators=evaluators)
         return results
 

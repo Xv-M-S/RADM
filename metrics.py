@@ -18,10 +18,42 @@ import time
 import glob
 import os
 import matplotlib.pyplot as plt
+from metric_eval.rhsm import calculate_rshm, mask_image, preprocess_image
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 color=['blue','green','red', 'yellow','black']
+
+
+def cal_R_shm(test_annotation, imageID2filename, imgdir):
+    """
+        Rshm means the similarity between the masked image and the original image in feature space.
+            🔬 计算方法
+            ● 使用预训练的 VGG16 模型提取图像特征；
+            ● 对每个布局元素：
+            ○ 在原图上应用掩码，遮挡该元素所在区域；
+            ○ 提取掩码后图像的特征向量；
+            ○ 计算掩码后图像与原图在特征空间的距离（L2距离）；
+            ● Rshm = 所有元素距离的平均值。
+            📈 趋势
+            ● Rshm 越大越好（理想值=∞，表示遮挡元素后图像与原图差异巨大）；
+            ● 与布局质量正相关：重要元素被遮挡后，整体布局效果会显著下降。
+    """
+    rshm_values = []
+    for layout in tqdm(test_annotation):
+        image_path= os.path.join(imgdir, imageID2filename[layout[0]['image_id']])
+        # if image_path.endswith('.png'):
+        #     image_path = image_path[:-4] + '.jpg'
+        img_tensor, width, height = preprocess_image(image_path)
+        for lay in layout:
+            x1,y1,w,h=int(lay['bbox'][0]),int(lay['bbox'][1]),int(lay['bbox'][2]),int(lay['bbox'][3])
+            # print('x1,y1,w,h',x1,y1,w,h)
+            layout_region = (x1, y1, x1+w, y1+h)
+            masked_img_tensor = mask_image(img_tensor, layout_region, width, height)
+            l2_distance = calculate_rshm(img_tensor, masked_img_tensor)
+            rshm_values.append(l2_distance)
+    return sum(rshm_values)/len(rshm_values) if len(rshm_values)!=0 else 0
+
 
 
 def cal_R_ove(test_annotation):
@@ -192,6 +224,7 @@ def main(test_label, test_annotation, imgdir, output_imgdir):
     print('R_ove: ', cal_R_ove(res))
     print('R_und: ', cal_R_und(res))
     print('R_ali: ', cal_R_ali(res , imageID2filename, imgdir))
+    print("R_shm: ", cal_R_shm(res, imageID2filename, imgdir))
 
 
 if __name__ == "__main__":
@@ -217,9 +250,16 @@ if __name__ == "__main__":
     
     test_imgdir: 
     '''
-    test_imgdir = '/home/lifengheng6/RADM_dataset/images/test'
-    test_label = '/home/lifengheng6/RADM_dataset/annotations/test.json'
-    test_annotation = '/home/lifengheng6/outputs_notebook2/inference/coco_instances_results.json'
+    # test_imgdir = '/home/lifengheng6/RADM_dataset/images/test'
+    # test_label = '/home/lifengheng6/RADM_dataset/annotations/test.json'
+    # test_annotation = '/home/lifengheng6/outputs_notebook2/inference/coco_instances_results.json'
+    # vis_example = './vis_example/'
+
+    test_imgdir = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset/images/test'
+    test_label = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset/annotations/test.json'
+    # test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_serm/inference/coco_instances_results.json'
+    # test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_dual_stream_serm/inference/coco_instances_results.json'
+    test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_dual_gram/inference/coco_instances_results.json'
     vis_example = './vis_example/'
     main(test_label, test_annotation, test_imgdir, vis_example)
     

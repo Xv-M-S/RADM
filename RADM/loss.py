@@ -20,6 +20,68 @@ from .util.misc import get_world_size, is_dist_avail_and_initialized
 from .util.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh, generalized_box_iou
 
 
+class ContrastiveAlignmentLoss(nn.Module):
+    def __init__(self, align_threshold=0.02):
+        super().__init__()
+        self.threshold = align_threshold
+        self.bce_loss = nn.BCELoss()
+
+    def build_gt_alignment_matrix(self, gt_boxes):
+        """
+        构建 Ground Truth 对齐矩阵。
+        如果两个框在 X 轴或 Y 轴对齐，则它们应该有关联 (1)，否则为 (0)。
+        gt_boxes: [B, N, 4] (cx, cy, w, h)
+        """
+        B, N, _ = gt_boxes.shape
+        cx = gt_boxes[:, :, 0].unsqueeze(2) # [B, N, 1]
+        cy = gt_boxes[:, :, 1].unsqueeze(2) # [B, N, 1]
+        
+        # 计算坐标差值矩阵 [B, N, N]
+        diff_x = torch.abs(cx - cx.transpose(1, 2))
+        diff_y = torch.abs(cy - cy.transpose(1, 2))
+        
+        # 判断对齐 (左对齐、中心对齐、右对齐... 这里简化为中心对齐)
+        # 实际操作中可以使用 IoU 或者 边缘距离，这里为了演示用中心距离
+        is_aligned_x = (diff_x < self.threshold).float()
+        is_aligned_y = (diff_y < self.threshold).float()
+        
+        # 只要有一个轴对齐，就算对齐
+        alignment_matrix = torch.clamp(is_aligned_x + is_aligned_y, 0, 1)
+        
+        # 对角线置为 0 (不计算自己对自己的 Loss，避免 trivial solution)
+        eye = torch.eye(N, device=gt_boxes.device).unsqueeze(0).expand(B, N, N)
+        alignment_matrix = alignment_matrix * (1 - eye)
+        
+        return alignment_matrix
+
+    def forward(self, attn_weights, gt_boxes):
+        """
+        Args:
+            attn_weights: [B, N, N] - 来自 SERM 的注意力权重 (Average over heads)
+            gt_boxes: [B, N, 4] - 真实的布局框
+        """
+        # 1. 获取 GT 对齐关系
+        target_matrix = self.build_gt_alignment_matrix(gt_boxes)
+        
+        # 2. 处理预测的 Attention Map
+        # 因为 Multihead 输出可能是 [B, N, N]，如果是多头，通常需要取平均
+        # 如果 attn_weights 是 [B, Num_Heads, N, N]，则先 mean(1)
+        if attn_weights.dim() == 4:
+            attn_weights = attn_weights.mean(dim=1)
+            
+        # 归一化 Attention 到 0-1 之间 (虽然 Softmax 后已经是，但为了数值稳定)
+        # 这里实际上我们希望 Attention Map 去拟合二分类矩阵
+        # 使用 Sigmoid 还是直接 MSE? 
+        # 推荐：将 Attention 视为概率，尽可能推高对齐位置的权重
+        
+        # 简单做法：只优化 Top 这里的数值
+        loss = F.mse_loss(attn_weights, target_matrix)
+        
+        # 高级做法 (InfoNCE 思想):
+        # maximize attention on aligned pairs, minimize on others
+        # 这里用简单的 MSE 即可证明有效性
+        return loss * 10.0 # 权重系数，通常需要设大一点
+
 class SetCriterionDynamicK(nn.Module):
     """ This class computes the loss for RADM.
     The process happens in two steps:

@@ -22,6 +22,8 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
+from .improve_config import config as cfg_improve
+from .layers import StructureEvolvingSERM, DualStreamSERM, DualGeometryRelationAwareModule
 
 from detectron2.modeling.poolers import ROIPooler
 from detectron2.structures import Boxes
@@ -64,6 +66,100 @@ class VisualTextualRelationAwareModule(nn.Module):
         mm = self.project_mm(mm)  # (B, dim, H*W)
 
         mm = mm.permute(0, 2, 1)  # (B, H*W, dim)
+
+        return mm
+
+
+# ==========================================
+# [New Module] Time-Adaptive Semantic Injection (TASI)
+# ==========================================
+class TimeAdaptiveVTRAM(nn.Module):
+    """
+    改进版 VTRAM：引入时间步 (Time Embedding) 动态调节特征注入强度。
+    """
+    def __init__(self, dim, v_in_channels, l_in_channels, key_channels, value_channels, propose_num, num_heads=2, dropout=0.0):
+        super(TimeAdaptiveVTRAM, self).__init__()
+        
+        # 1. 基础的视觉投影
+        self.vis_project = nn.Sequential(
+            nn.Conv1d(dim, dim, 1, 1),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+               
+        # 2. 核心 Cross-Attention (复用原有的 VisualTextualAtten)
+        # 注意：这里我们假设 VisualTextualAtten 的逻辑不需要大改，它负责计算 Attention Map
+        self.image_lang_att = VisualTextualAtten(
+            v_in_channels, l_in_channels, key_channels, value_channels,
+            propose_num=propose_num, out_channels=value_channels, num_heads=num_heads
+        )
+        
+        # 3. 输出投影
+        self.project_mm = nn.Sequential(
+            nn.Conv1d(value_channels, value_channels, 1, 1),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        # 4. [New] Time-Gating MLP (FiLM生成器)
+        # 输入维度: time_dim (通常是 d_model * 4)
+        # 输出维度: dim * 2 (对应 scale 和 shift)
+        # 我们假设 time_emb 的维度是 dim * 4 (参考 DynamicHead 里的 time_mlp)
+        self.time_gate_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 2) 
+        )
+        
+        # 初始化为 0，保证初始状态下不干扰
+        nn.init.zeros_(self.time_gate_mlp[-1].weight)
+        nn.init.zeros_(self.time_gate_mlp[-1].bias)
+
+    def forward(self, x, l, l_mask, PE, time_emb):
+        """
+        x: (Total_Proposals, H*W, dim) -> e.g., (1600, 49, 256)
+        time_emb: (Batch_Size, time_dim) -> e.g., (16, 1024)
+        """
+        
+        # 1. 视觉特征投影
+        vis = self.vis_project(x.permute(0, 2, 1)) 
+        
+        # 2. 计算 Attention 后的特征
+        lang = self.image_lang_att(x, l, l_mask, PE)
+        lang = lang.permute(0, 2, 1)
+
+        # -------------------------------------------------------------
+        # [修复] 维度对齐
+        # -------------------------------------------------------------
+        # 计算 scale 和 shift, 此时 shape 是 [Batch_Size, dim] -> [16, 256]
+        style = self.time_gate_mlp(time_emb)
+        scale, shift = style.chunk(2, dim=1)
+        
+        # 计算每个 Batch 有多少个 Proposal (N_proposals)
+        # Total_Proposals (1600) / Batch_Size (16) = 100
+        total_proposals = x.shape[0]
+        batch_size = time_emb.shape[0]
+        num_proposals = total_proposals // batch_size
+        
+        # 将 [Batch, Dim] -> [Batch, Num_Proposals, Dim]
+        # 然后 Flatten 成 [Total_Proposals, Dim] -> [1600, 256]
+        scale = scale.unsqueeze(1).repeat(1, num_proposals, 1).reshape(-1, scale.shape[-1])
+        shift = shift.unsqueeze(1).repeat(1, num_proposals, 1).reshape(-1, shift.shape[-1])
+        
+        # 调整为 (Total_Proposals, Dim, 1) 以便与 (N, C, HW) 进行广播
+        scale = scale.unsqueeze(-1) # [1600, 256, 1]
+        shift = shift.unsqueeze(-1) # [1600, 256, 1]
+        
+        # -------------------------------------------------------------
+
+        # 动态融合
+        mm = torch.mul(vis, lang) 
+        
+        # 现在维度匹配了: [1600, 256, 49] * [1600, 256, 1]
+        mm = mm * (1 + scale) + shift 
+        
+        # 投影与输出
+        mm = self.project_mm(mm) 
+        mm = mm.permute(0, 2, 1) 
 
         return mm
 
@@ -453,12 +549,45 @@ class RCNNHead(nn.Module):
 
         if self.withVTRAM:
             self.d_fused += d_model
-            self.vis_text_att = VisualTextualRelationAwareModule(d_model, d_model, 768, d_model, d_model, self.propose_num, 2, 0)
+            
+            # 注意: 初始化参数与旧的一致，只是类名变了
+            if cfg_improve.TASI_ENABLED:
+                self.vis_text_att = TimeAdaptiveVTRAM(
+                    d_model, d_model, 768, d_model, d_model, 
+                    self.propose_num, 2, 0
+                )
+            else:
+                self.vis_text_att = VisualTextualRelationAwareModule(d_model, d_model, 768, d_model, d_model, self.propose_num, 2, 0)
+            
             self.linear4 = nn.Linear(4, d_model)
 
         if self.withGRAM: 
-            self.d_fused += topo_out_dim
-            self.GRAM = GeometryRelationAwareModule(topo_in_dim=256*7*7, topo_out_dim=topo_out_dim)#256*7*7 RoIpooling output dimension
+            if cfg_improve.SERM:
+                # SERM 输出维度通常保持为 d_model
+                self.d_fused += d_model 
+                
+                # 初始化 SERM 模块
+                # 注意：确保 layers.py 里已经有了 StructureEvolvingSERM 类
+                self.serm = StructureEvolvingSERM(
+                    d_model=d_model, 
+                    nhead=nhead,
+                    k_neighbors=getattr(cfg_improve, 'SERM_K', 5), # 默认 K=5
+                    dropout=dropout
+                )
+            elif cfg_improve.DUAL_STREAM_SERM:
+                self.d_fused += d_model
+                self.serm = DualStreamSERM(
+                    d_model=d_model, 
+                    nhead=nhead,
+                    k_neighbors=getattr(cfg_improve, 'SERM_K', 5), # 默认 K=5
+                    dropout=dropout
+                )
+            elif cfg_improve.DUAL_GTRAM:
+                self.d_fused += topo_out_dim
+                self.GRAM = DualGeometryRelationAwareModule(topo_in_dim=256*7*7, topo_out_dim=topo_out_dim)#256*7*7 RoIpooling output dimension
+            else:
+                self.d_fused += topo_out_dim
+                self.GRAM = GeometryRelationAwareModule(topo_in_dim=256*7*7, topo_out_dim=topo_out_dim)#256*7*7 RoIpooling output dimension
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -527,13 +656,45 @@ class RCNNHead(nn.Module):
         txt_features = txt_features.view(N, 768, -1)
         # GTRAM
         if self.withGRAM:
-            top_features = self.GRAM(bboxes, bboxes, roi_features, N)  #[batch_size * num_proposals, 256]
+            if cfg_improve.SERM:
+                # [CRITICAL FIX] 维度修复：
+                # 如果是级联的后续 Stage，pro_features 可能是 [1, N*nr_boxes, C]
+                # SERM 需要知道哪些 box 属于同一张图来构建 Graph，所以必须 reshape 回 [N, nr_boxes, C]
+                if pro_features.shape[0] == 1 and pro_features.shape[1] == N * nr_boxes:
+                    serm_input = pro_features.view(N, nr_boxes, -1)
+                else:
+                    serm_input = pro_features
+                
+                # 调用 SERM
+                # 不需要 Loss 时，忽略第二个返回值 (attn_map)
+                serm_feats, _ = self.serm(bboxes, serm_input)
+                
+                # 将结果 Flatten 以便与后续 fc_feature 拼接 [N*nr_boxes, C]
+                top_features = serm_feats.reshape(N * nr_boxes, -1)
+            elif cfg_improve.DUAL_STREAM_SERM:
+                # 1. 准备语义特征 (Semantics Stream)
+                # 这里的 pro_features 包含了刚刚经过 Self-Attn / DynamicConv 提取的高级语义
+                # 如果是第一层，它是 ROI Pooler 的特征；如果是后续层，它是上一层的输出
+                serm_input = pro_features.view(N, nr_boxes, -1)
+
+                # 2. 调用 SERM (传入 Geometry 和 Semantics)
+                # 这里的 bboxes 负责计算 Geometry Stream
+                serm_feats, _ = self.serm(bboxes, serm_input)
+                
+                # 3. Flatten
+                top_features = serm_feats.reshape(N * nr_boxes, -1)
+            else:
+                top_features = self.GRAM(bboxes, bboxes, roi_features, N)  #[batch_size * num_proposals, 256]
         roi_features = roi_features.view(N * nr_boxes , self.d_model, -1).permute(0, 2, 1) # (N*p, 7*7, 256)
         
         #VTRAM
         if self.withVTRAM:
             PE = self.linear4(norm_bboxes)
-            mm_fea = self.vis_text_att(roi_features, txt_features, txt_mask, PE)   #(B, p*w*h, 256)
+            
+            if cfg_improve.TASI_ENABLED:
+                mm_fea = self.vis_text_att(roi_features, txt_features, txt_mask, PE, time_emb)
+            else:
+                mm_fea = self.vis_text_att(roi_features, txt_features, txt_mask, PE)   #(B, p*w*h, 256)
             mm_fea = mm_fea.reshape(N * nr_boxes, self.d_model, -1).mean(-1)
        
         pro_features = pro_features.view(N, nr_boxes, self.d_model).permute(1, 0, 2)  #(B, p, 256)
