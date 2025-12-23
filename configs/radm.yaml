@@ -10,6 +10,8 @@ MODEL:
     NUM_CLASSES: 4
     NMS_THRESH: 0.15
     CLASS_THRESH: 0.25
+
+
 DATASETS:
   TEXT_FEATURE_PATH: '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset/text_features'
   DATASET_PATH: '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset'
@@ -22,5 +24,35 @@ INPUT:
   CROP:
     ENABLED: False
   FORMAT: "RGB"
-OUTPUT_DIR: "./output"
+OUTPUT_DIR: "./output_dual_gram"
+RL:
+  # RL Training Parameters
+  NUM_ENV_STEPS: 10000000
+  NUM_STEPS: 2048
+  NUM_PROCESSES: 1
+  LOG_INTERVAL: 1
+  SAVE_INTERVAL: 100
+  EVAL_INTERVAL: 10
+  LOG_LEVEL: INFO  # DEBUG, INFO, WARNING
 
+  # PPO Parameters
+  CLIP_PARAM: 0.2
+  PPO_EPOCH: 10
+  NUM_MINI_BATCH: 5
+  VALUE_LOSS_COEF: 0.5
+  ENTROPY_COEF: 0.01
+  MAX_GRAD_NORM: 0.5
+  LR: 0.0003
+
+  # Environment Parameters
+  MAX_ELEMENTS: 20
+  MAX_STEPS: 50
+  ACTION_SCALE: 0.1
+  HIDDEN_DIM: 256
+
+  # Reward Weights
+  OVERLAP_PENALTY: -2.0
+  ALIGNMENT_BONUS: 1.0
+  BALANCE_BONUS: 0.5
+  SEMANTIC_COHERENCE: 0.8
+  AESTHETIC_SCORE: 1.2

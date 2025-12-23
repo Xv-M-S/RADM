@@ -7,7 +7,7 @@
 # Contact: {sunpeize, cxrfzhang}@foxmail.com
 #
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-from .config import add_radm_config
+from .config import add_radm_config, add_rl_config
 from .detector import RADM
 from .dataset_mapper import RADMDatasetMapper
 from .test_time_augmentation import RADMWithTTA

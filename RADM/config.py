@@ -9,6 +9,35 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from detectron2.config import CfgNode as CN
 
+def add_rl_config(cfg):
+    """
+    Add config for RL
+    """
+    cfg.RL = CN()
+    cfg.RL.NUM_ENV_STEPS = 10000000
+    cfg.RL.NUM_STEPS = 2048
+    cfg.RL.NUM_PROCESSES = 1
+    cfg.RL.LOG_INTERVAL = 1
+    cfg.RL.SAVE_INTERVAL = 100
+    cfg.RL.EVAL_INTERVAL = 10
+    cfg.RL.CLIP_PARAM = 0.2
+    cfg.RL.PPO_EPOCH = 10
+    cfg.RL.NUM_MINI_BATCH = 5
+    cfg.RL.VALUE_LOSS_COEF = 0.5
+    cfg.RL.ENTROPY_COEF = 0.01
+    cfg.RL.MAX_GRAD_NORM = 0.5
+    cfg.RL.LR = 0.0001
+    cfg.RL.MAX_ELEMENTS = 20
+    cfg.RL.MAX_STEPS = 50
+    cfg.RL.ACTION_SCALE = 0.1
+    cfg.RL.HIDDEN_DIM = 256
+    cfg.RL.OVERLAP_PENALTY =  -2.0
+    cfg.RL.ALIGNMENT_BONUS = 1.0
+    cfg.RL.BALANCE_BONUS = 0.5
+    cfg.RL.SEMANTIC_COHERENCE = 0.8
+    cfg.RL.AESTHETIC_SCORE = 1.2
+    cfg.RL.LOG_LEVEL = "INFO"
+
 
 def add_radm_config(cfg):
     """

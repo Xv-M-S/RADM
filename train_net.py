@@ -33,9 +33,10 @@ from detectron2.evaluation import COCOEvaluator, LVISEvaluator, verify_results, 
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.modeling import build_model
 
-from RADM import RADMDatasetMapper, add_radm_config, RADMWithTTA
+from RADM import RADMDatasetMapper, add_radm_config, add_rl_config, RADMWithTTA
 from RADM.util.model_ema import add_model_ema_configs, may_build_model_ema, may_get_ema_checkpointer, EMAHook, \
     apply_model_ema_and_restore, EMADetectionCheckpointer
+from RADM.rl_trainer import RLLayoutTrainer
 
 import pdb
 
@@ -179,13 +180,21 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
+        logger = logging.getLogger(__name__)
+        logger.info("Building training data loader...")
         mapper = RADMDatasetMapper(cfg, is_train=True)
-        return build_detection_train_loader(cfg, mapper=mapper)
-   
+        loader = build_detection_train_loader(cfg, mapper=mapper)
+        logger.info(f"Training data loader created with batch size {cfg.SOLVER.IMS_PER_BATCH}")
+        return loader
+
     @classmethod
     def build_test_loader(cls, cfg):
+        logger = logging.getLogger(__name__)
+        logger.info("Building test data loader...")
         mapper = RADMDatasetMapper(cfg, is_train=False)
-        return build_detection_test_loader(cfg, 'layout_val', mapper=mapper)
+        loader = build_detection_test_loader(cfg, 'layout_val', mapper=mapper)
+        logger.info("Test data loader created")
+        return loader
 
     @classmethod
     def build_optimizer(cls, cfg, model):
@@ -318,40 +327,71 @@ class Trainer(DefaultTrainer):
     
 # add layout register
 def register_layout(cfg):
+    logger = logging.getLogger(__name__)
+    logger.info("Registering layout datasets...")
+
     DATASET_ROOT = cfg.DATASETS.DATASET_PATH
     ANN_ROOT = os.path.join(DATASET_ROOT, 'annotations')
-    TRAIN_JSON = os.path.join(ANN_ROOT, 'train.json')
+    # TRAIN_JSON = os.path.join(ANN_ROOT, 'train.json')
+    TRAIN_JSON = os.path.join(ANN_ROOT, 'test.json')
     VAL_JSON = os.path.join(ANN_ROOT, 'test.json')
 
     IMAGE_ROOT = os.path.join(DATASET_ROOT, 'images')
-    TRAIN_PATH = os.path.join(IMAGE_ROOT, 'train')
+    # TRAIN_PATH = os.path.join(IMAGE_ROOT, 'train')
+    TRAIN_PATH = os.path.join(IMAGE_ROOT, 'test')
     VAL_PATH = os.path.join(IMAGE_ROOT, 'test')
 
+    logger.info(f"Dataset root: {DATASET_ROOT}")
+    logger.info(f"Training annotations: {TRAIN_JSON}")
+    logger.info(f"Validation annotations: {VAL_JSON}")
 
     element_category = ["Logo", "文字", "衬底", "符号元素", "强调突出子部分文字"]
+    logger.info(f"Element categories: {element_category}")
 
+    logger.info("Registering training dataset...")
     DatasetCatalog.register("layout_train", lambda: load_coco_json(TRAIN_JSON, image_root=TRAIN_PATH, dataset_name="layout_train"))
     MetadataCatalog.get("layout_train").set(thing_classes = element_category,
                                                         json_file=TRAIN_JSON,
                                                         image_root=TRAIN_PATH)
-    
+
+    logger.info("Registering validation dataset...")
     DatasetCatalog.register("layout_val", lambda: load_coco_json(VAL_JSON, image_root=VAL_PATH, dataset_name="layout_val"))
     MetadataCatalog.get("layout_val").set(thing_classes=element_category,
                                                     json_file=VAL_JSON,
                                                     image_root=VAL_PATH)
+
+    logger.info("Dataset registration completed")
 # add done
 
 def setup(args):
     """
     Create configs and perform basic setups.
     """
+    logger = logging.getLogger(__name__)
+    logger.info("Setting up configuration...")
+
     cfg = get_cfg()
+    logger.info("Adding RADM configuration...")
     add_radm_config(cfg)
     add_model_ema_configs(cfg)
+
+    # Always add RL config to handle config files that contain RL sections
+    logger.info("Adding RL configuration...")
+    add_rl_config(cfg)
+
+    logger.info(f"Loading config file: {args.config_file}")
     cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+    if args.opts:
+        logger.info(f"Merging command line options: {args.opts}")
+        cfg.merge_from_list(args.opts)
+
     cfg.freeze()
+    logger.info("Configuration frozen")
+
+    logger.info("Performing default setup...")
     default_setup(cfg, args)
+
+    logger.info("Setup completed")
     return cfg
 
 
@@ -359,15 +399,90 @@ def main(args):
     cfg = setup(args)
     register_layout(cfg)
 
+    # Get logger (after default_setup which may configure logging)
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)  # Ensure our logger level is set
+
+    # Check if RL training is enabled
+    print(f"Checking RL training: hasattr(args, 'rl_train')={hasattr(args, 'rl_train')}")
+    if hasattr(args, 'rl_train'):
+        print(f"args.rl_train = {args.rl_train}")
+    else:
+        print("args does not have rl_train attribute")
+
+    if hasattr(args, 'rl_train') and args.rl_train:
+        # RL Training Mode
+        print("=== RL TRAINING MODE ACTIVATED ===")
+        logger.info("Starting RL training mode...")
+
+        # Load pre-trained RADM model
+        print("=== LOADING RADM MODEL ===")
+        logger.info("Loading pre-trained RADM model...")
+        try:
+            radm_model = Trainer.build_model(cfg)
+            kwargs = may_get_ema_checkpointer(cfg, radm_model)
+
+            # Simplified weight loading without EMA
+            DetectionCheckpointer(radm_model, save_dir=cfg.OUTPUT_DIR, **kwargs).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
+            
+            logger.info("RADM model loaded successfully")
+        except Exception as e:
+            print(f"Error loading RADM model: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+        # Create data loader for RL training
+        print("Creating data loader for RL training...")
+        logger.info("Creating data loader for RL training...")
+        try:
+            data_loader = Trainer.build_train_loader(cfg)
+        except Exception as e:
+            print(f"Error creating data loader: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+        # Initialize RL trainer
+        try:
+            rl_trainer = RLLayoutTrainer(cfg, radm_model)
+        except Exception as e:
+            print(f"Error initializing RL trainer: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+        # Start RL training
+        print("Starting RL training...")
+        logger.info("Starting RL training...")
+        try:
+            rl_trainer.train(data_loader)
+            print("RL training completed!")
+        except Exception as e:
+            print(f"Error during RL training: {e}")
+            print(f"Error type: {type(e)}")
+            import traceback
+            traceback.print_exc()
+
+        return None
+
     if args.eval_only:
+        print("=== EVALUATION MODE START ===")
+        logger.info("Evaluation mode enabled")
+        logger.info("Building model...")
+        print("Building model...")
         model = Trainer.build_model(cfg)
         kwargs = may_get_ema_checkpointer(cfg, model)
+        logger.info("Loading model weights...")
+        print("Loading model weights...")
         if cfg.MODEL_EMA.ENABLED:
             EMADetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR, **kwargs).resume_or_load(cfg.MODEL.WEIGHTS,
                                                                                               resume=args.resume)
         else:
             DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR, **kwargs).resume_or_load(cfg.MODEL.WEIGHTS,
                                                                                            resume=args.resume)
+        logger.info("Starting evaluation...")
+        print("Starting evaluation...")
         res = Trainer.ema_test(cfg, model)
         if cfg.TEST.AUG.ENABLED:
             res.update(Trainer.test_with_TTA(cfg, model))
@@ -375,13 +490,29 @@ def main(args):
             verify_results(cfg, res)
         return res
 
+    logger.info("Training mode enabled")
+    logger.info("Initializing trainer...")
     trainer = Trainer(cfg)
+    logger.info("Loading checkpoint...")
     trainer.resume_or_load(resume=args.resume)
+
+    logger.info("Starting training...")
+    logger.info(f"Configuration summary:")
+    logger.info(f"  - Dataset: {cfg.DATASETS.TRAIN}")
+    logger.info(f"  - Batch size: {cfg.SOLVER.IMS_PER_BATCH}")
+    logger.info(f"  - Learning rate: {cfg.SOLVER.BASE_LR}")
+    logger.info(f"  - Max iterations: {cfg.SOLVER.MAX_ITER}")
+    logger.info(f"  - Output dir: {cfg.OUTPUT_DIR}")
+
     return trainer.train()
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    parser.add_argument('--rl-train', action='store_true', help='Enable RL training mode')
+    parser.add_argument('--rl-checkpoint', type=str, default='', help='Path to RL checkpoint for inference')
+
+    args = parser.parse_args()
     print("Command Line Args:", args)
     launch(
         main,
