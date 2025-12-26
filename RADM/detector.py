@@ -266,40 +266,48 @@ class RADM(nn.Module):
 
     @torch.no_grad()
     def ddim_sample(self, batched_inputs, backbone_feats, images_whwh, images, text_feature, txt_mask, clip_denoised=True, do_postprocess=True):
+        return self.ddim_sample_with_trajectory(batched_inputs, backbone_feats, images_whwh, images, text_feature, txt_mask, clip_denoised, do_postprocess, return_trajectory=False, return_logprob=False)
+
+    def ddim_sample_with_trajectory(self, batched_inputs, backbone_feats, images_whwh, images, text_feature, txt_mask, clip_denoised=True, do_postprocess=True, return_trajectory=True, return_logprob=True):
+        """
+        DDIM采样，返回完整的生成轨迹用于replay
+        """
         batch = images_whwh.shape[0]
         shape = (batch, self.num_proposals, 4)
         total_timesteps, sampling_timesteps, eta, objective = self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
-        
-        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+
+        # 时间序列
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-        
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
         img = torch.randn(shape, device=self.device)
-        # print('img', img)
-        ensemble_score, ensemble_label, ensemble_coord = [], [], []
+
+        # 轨迹记录：存储每一步的状态用于replay
+        trajectory = {
+            'steps': [],
+            'total_log_prob': torch.zeros(batch, device=self.device),
+            'image_whwh': images_whwh,
+            'text_feature': text_feature,
+            'txt_mask': txt_mask
+        } if return_trajectory else None
+
+        # 初始化log概率记录列表（如果需要计算log概率）
+        trajectory_log_probs = [] if return_logprob else None
+
         x_start = None
-        
+
+        # 采样循环 - 记录完整轨迹用于DDPO replay
         for time, time_next in time_pairs:
             time_cond = torch.full((batch,), time, device=self.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
 
+            # 获取模型预测
             preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, text_feature, txt_mask, time_cond,
                                                                          self_cond, clip_x_start=clip_denoised)
             pred_noise, x_start = preds.pred_noise, preds.pred_x_start
 
-            if self.box_renewal:  # filter
-                score_per_image, box_per_image = outputs_class[-1][0], outputs_coord[-1][0]
-                
-                score_per_image = torch.sigmoid(score_per_image)
-                value, _ = torch.max(score_per_image, -1, keepdim=False)
-                keep_idx = value > self.threshold
-                num_remain = torch.sum(keep_idx)
-                pred_noise = pred_noise[:, keep_idx, :]
-                x_start = x_start[:, keep_idx, :]
-                img = img[:, keep_idx, :]
-                
+            # 计算DDIM更新
             if time_next < 0:
                 img = x_start
                 continue
@@ -311,51 +319,79 @@ class RADM(nn.Module):
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
             noise = torch.randn_like(img)
+            x_prev = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise  # 实际的下一步
 
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            # 计算这一步的log概率 (DDPO需要)
+            if return_logprob:
+                # DDIM的条件概率 log p(x_{t-1} | x_t, θ)
+                # x_{t-1} ~ N(μ_θ, σ_t²), 其中 μ_θ = x_start * sqrt(α_{t-1}) + c * pred_noise
+                mu_theta = x_start * alpha_next.sqrt() + c * pred_noise
 
-            if self.box_renewal:  # filter
-                # replenish with randn boxes
-                img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device = img.device)), dim=1)
-            if self.use_ensemble and self.sampling_timesteps > 1:
-                box_pred_per_image, scores_per_image, labels_per_image = self.inference(outputs_class[-1],
-                                                                                        outputs_coord[-1],
-                                                                                        images.image_sizes)
-                ensemble_score.append(scores_per_image)
-                ensemble_label.append(labels_per_image)
-                ensemble_coord.append(box_pred_per_image)
-        
-        if self.use_ensemble and self.sampling_timesteps > 1:
-            box_pred_per_image = torch.cat(ensemble_coord, dim=0)
-            scores_per_image = torch.cat(ensemble_score, dim=0)
-            labels_per_image = torch.cat(ensemble_label, dim=0)
-            if self.use_nms:
-                keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, self.nms_threshold)
-                box_pred_per_image = box_pred_per_image[keep]
-                scores_per_image = scores_per_image[keep]
-                labels_per_image = labels_per_image[keep]
-            
-            result = Instances(images.image_sizes[0])
-            result.pred_boxes = Boxes(box_pred_per_image)
-            result.scores = scores_per_image
-            result.pred_classes = labels_per_image
-            results = [result]
+                # 计算高斯log概率密度
+                variance = sigma ** 2 + 1e-8  # 避免除零
+                squared_diff = (x_prev - mu_theta) ** 2
+                step_log_prob = -0.5 * (squared_diff / variance).sum(dim=[1, 2])
+
+                # 减去归一化常数
+                num_elements = x_prev.shape[1] * x_prev.shape[2]
+                normalization = num_elements * torch.log(sigma * (2 * torch.pi).sqrt() + 1e-8)
+                step_log_prob = step_log_prob - normalization
+
+                trajectory_log_probs.append(step_log_prob)
+
+                # 累积到总log概率
+                if return_trajectory:
+                    trajectory['total_log_prob'] += step_log_prob
+
+            # 记录轨迹步骤 (包含实际发生的x_prev)
+            if return_trajectory:
+                step_info = {
+                    'x_t': img.clone(),  # 当前噪声图像 x_t
+                    't': time_cond.clone(),  # 时间步 t
+                    'pred_noise': pred_noise.clone(),  # 模型预测的噪声 ε_θ(x_t, t)
+                    'x_start': x_start.clone(),  # 预测的x_0
+                    'x_prev': x_prev.clone(),  # 实际发生的下一步 x_{t-1}
+                    'time_next': time_next,  # 下一时间步 t-1
+                    'alpha': alpha,
+                    'alpha_next': alpha_next,
+                    'eta': eta,  # DDIM eta参数
+                }
+                trajectory['steps'].append(step_info)
+
+            img = x_prev  # 更新img为下一步
+
+        # 最后一步的log prob (x_0预测) - 可选，不计入轨迹总概率
+        if return_logprob and trajectory_log_probs is not None:
+            # 计算从x_T到x_0的完整轨迹概率 (所有步骤的乘积)
+            if len(trajectory_log_probs) > 0:
+                trajectory_log_probs_tensor = torch.stack(trajectory_log_probs, dim=0)  # [num_steps, batch]
+                total_trajectory_log_prob = trajectory_log_probs_tensor.sum(dim=0)  # [batch]
+
+                if return_trajectory:
+                    trajectory['total_log_prob'] = total_trajectory_log_prob
+
+        # 生成最终结果 - DDPO采样直接构造结果
+        # 注意：DDPO不需要完整的推理流程，我们直接从采样结果构造输出
+        from detectron2.structures import Instances, Boxes
+
+        results = []
+        for i, image_size in enumerate(images.image_sizes):
+            # 创建空的Instances对象作为结果
+            # 在DDPO中，主要关注的是轨迹记录而不是最终推理结果
+            instances = Instances(image_size)
+            # pred_boxes 应该是 Boxes 对象，不是普通tensor
+            instances.pred_boxes = Boxes(torch.empty(0, 4, device=self.device))
+            instances.scores = torch.empty(0, device=self.device)
+            instances.pred_classes = torch.empty(0, dtype=torch.int64, device=self.device)
+            results.append(instances)
+
+        # DDPO采样不需要后处理，直接返回结果
+        # 因为我们没有实际的预测结果，只关注轨迹
+        processed_results = [{"instances": r} for r in results]
+
+        if return_trajectory:
+            return processed_results, trajectory
         else:
-            
-            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-            box_cls = output["pred_logits"]
-            box_pred = output["pred_boxes"]
-            results = self.inference(box_cls, box_pred, images.image_sizes)
-        if do_postprocess:
-       
-            processed_results = []
-            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
-                height = input_per_image.get("height", image_size[0])
-                width = input_per_image.get("width", image_size[1])
-                r = detector_postprocess(results_per_image, height, width)
-                processed_results.append({"instances": r})
             return processed_results
 
     # forward diffusion

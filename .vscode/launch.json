@@ -1,0 +1,110 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: train_net.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_net.py", // 入口脚本
+            "console": "integratedTerminal",
+            "python": "/home/sxm/anaconda3/envs/radm/bin/python3",
+            "justMyCode": false, // 想调试第三方库改成 true
+            "args": [
+                "--num-gpus",
+                "1",
+                "--config-file",
+                "configs/radm.yaml",
+                "--eval-only",
+                "--resume"
+            ],
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": null, // 关键：取消该环境变量，等效于unset
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        },
+        {
+            "name": "Python: train_net_v2.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_net.py", // 入口脚本
+            "console": "integratedTerminal",
+            "python": "/home/sxm/anaconda3/envs/radm/bin/python3",
+            "justMyCode": false, // 想调试第三方库改成 true
+            "args": [
+                "--num-gpus",
+                "1",
+                "--config-file",
+                "configs/radm.yaml",
+            ],
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": null, // 关键：取消该环境变量，等效于unset
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        },
+        {
+            "name": "Python: test rl_layout_env.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rl_test/rl_layout_env_test.py", // 入口脚本
+            "console": "integratedTerminal",
+            "python": "/home/sxm/anaconda3/envs/radm/bin/python3",
+            "justMyCode": false, // 想调试第三方库改成 true
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": null, // 关键：取消该环境变量，等效于unset
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        },
+        {
+            "name": "Python: test rl_agent_env.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rl_test/rl_agent_test.py", // 入口脚本
+            "console": "integratedTerminal",
+            "python": "/home/sxm/anaconda3/envs/radm/bin/python3",
+            "justMyCode": false, // 想调试第三方库改成 true
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": null, // 关键：取消该环境变量，等效于unset
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        },
+        {
+            "name": "Python: train_rl.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_rl.py", // 入口脚本
+            "console": "integratedTerminal",
+            "python": "/home/sxm/anaconda3/envs/radm/bin/python3",
+            "justMyCode": false, // 想调试第三方库改成 true
+            "args": [
+                "--config-file",
+                "configs/radm.yaml",
+            ],
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": null, // 关键：取消该环境变量，等效于unset
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
+        },
+        {
+            "name": "Python: train_net_rl.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_net.py", // 入口脚本
+            "console": "integratedTerminal",
+            "python": "/home/sxm/anaconda3/envs/radm/bin/python3",
+            "justMyCode": false, // 想调试第三方库改成 true
+            "args": [
+                "--config-file",
+                "configs/radm.yaml",
+                "--rl-train",
+                "--resume"
+            ],
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": null, // 关键：取消该环境变量，等效于unset
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
+        }
+    ]
+}

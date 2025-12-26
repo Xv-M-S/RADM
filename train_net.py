@@ -32,10 +32,13 @@ from detectron2.evaluation import COCOEvaluator, LVISEvaluator, verify_results, 
 
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.modeling import build_model
+from detectron2.utils.events import EventStorage
 
 from RADM import RADMDatasetMapper, add_radm_config, RADMWithTTA
 from RADM.util.model_ema import add_model_ema_configs, may_build_model_ema, may_get_ema_checkpointer, EMAHook, \
     apply_model_ema_and_restore, EMADetectionCheckpointer
+from RADM.layers import PreferenceModel, DDPOTrainer
+from RADM.util.box_ops import box_xyxy_to_cxcywh
 
 import pdb
 
@@ -61,10 +64,42 @@ class Trainer(DefaultTrainer):
             setup_logger()
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
 
+        # Set device (similar to RADM detector)
+        self.device = torch.device(cfg.MODEL.DEVICE)
+
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
+
+        # DDPO components
+        self.use_ddpo = cfg.MODEL.RADM.USE_DDPO
+        if self.use_ddpo:
+            self.preference_model = PreferenceModel(
+                layout_dim=cfg.MODEL.RADM.HIDDEN_DIM,
+                text_dim=768,  # RoBERTa embedding dim
+                hidden_dim=cfg.MODEL.RADM.DDPO_HIDDEN_DIM
+            ).to(self.device)
+
+            # DDPO使用布局坐标作为特征，维度为4 (x1,y1,x2,y2)
+            layout_dim = 4  # 布局坐标维度
+            self.ddpo_trainer = DDPOTrainer(
+                model=model,
+                preference_model=PreferenceModel(
+                    layout_dim=layout_dim,
+                    text_dim=768,  # RoBERTa embedding dim
+                    hidden_dim=cfg.MODEL.RADM.DDPO_HIDDEN_DIM
+                ).to(self.device),
+                beta=cfg.MODEL.RADM.DDPO_BETA,
+                sample_size=cfg.MODEL.RADM.DDPO_SAMPLE_SIZE
+            )
+
+            # DDPO optimizer
+            self.ddpo_optimizer = torch.optim.AdamW(
+                self.preference_model.parameters(),
+                lr=cfg.MODEL.RADM.DDPO_LR,
+                weight_decay=cfg.SOLVER.WEIGHT_DECAY
+            )
 
         model = create_ddp_model(model, broadcast_buffers=False)
         self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
@@ -315,6 +350,245 @@ class Trainer(DefaultTrainer):
             # run writers in the end, so that evaluation metrics are written
             ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
         return ret
+
+    def train_with_ddpo(self):
+        """
+        结合扩散模型训练和DDPO优化的训练循环
+        """
+        logger = logging.getLogger("detectron2")
+        logger.info("Starting training with DDPO...")
+
+        # 设置EventStorage上下文 (修复detectron2事件存储错误)
+        with EventStorage() as self.storage:
+            # 首先进行基础的扩散模型训练
+            max_iter = self.max_iter
+
+            # 训练开始欢迎信息
+            logger.info("=" * 80)
+            logger.info("🎯 RADM + DDPO Training Started!")
+            logger.info("🎨 Layout Generation with Reinforcement Learning from Human Preferences")
+            logger.info("=" * 80)
+
+            # DDPO训练配置总结
+            if self.use_ddpo:
+                logger.info("🚀 DDPO Training Configuration:")
+                logger.info(f"  📊 Sample Size: {self.cfg.MODEL.RADM.DDPO_SAMPLE_SIZE} (每次DDPO步骤的采样数量)")
+                logger.info(f"  🔄 Update Frequency: {self.cfg.MODEL.RADM.DDPO_UPDATE_FREQ} (每N个迭代进行一次DDPO更新)")
+                logger.info(f"  β Beta: {self.cfg.MODEL.RADM.DDPO_BETA} (DPO损失的正则化参数)")
+                logger.info(f"  🧠 Hidden Dim: {self.cfg.MODEL.RADM.DDPO_HIDDEN_DIM} (偏好模型隐藏层维度)")
+                logger.info(f"  📈 Total Expected DDPO Steps: {max_iter // self.cfg.MODEL.RADM.DDPO_UPDATE_FREQ}")
+                logger.info("=" * 70)
+            # diffusion_warmup_iters = int(max_iter * 0.3)  # 前30%用于纯扩散训练
+            diffusion_warmup_iters = 0 # 直接测试rl train
+
+            # 第一阶段：纯扩散模型训练
+            if diffusion_warmup_iters > 0:
+                logger.info("🌡️ Phase 1: Diffusion-only Warmup Training")
+                logger.info(f"   Training diffusion model for {diffusion_warmup_iters} iterations to stabilize...")
+                for self.iter in range(diffusion_warmup_iters):
+                    with EventStorage() as storage:
+                        self.storage = storage
+                        self.run_step()
+                    if self.iter % 1000 == 0 and self.iter > 0:
+                        logger.info(f"   🌡️ Diffusion warmup: iteration {self.iter}/{diffusion_warmup_iters}")
+                logger.info("✅ Phase 1 completed: Diffusion model warmed up!")
+            else:
+                logger.info("⚡ Skipping diffusion warmup (set to 0 iterations)")
+
+            # 第二阶段：扩散模型 + DDPO 联合训练
+            joint_iters = max_iter - diffusion_warmup_iters
+            logger.info("🤖 Phase 2: Joint Diffusion + DDPO Training")
+            logger.info(f"   Training both diffusion model and DDPO preference model for {joint_iters} iterations")
+        ddpo_step_count = 0
+        for self.iter in range(diffusion_warmup_iters, max_iter):
+            # 扩散模型训练步骤
+            with EventStorage() as storage:
+                self.storage = storage
+                self.run_step()
+
+            # DDPO训练步骤 (每隔一定迭代进行一次)
+            if self.iter % self.cfg.MODEL.RADM.DDPO_UPDATE_FREQ == 0:
+                ddpo_loss = self.ddpo_step()
+                ddpo_step_count += 1
+
+                        # 记录详细的DDPO训练日志
+                if ddpo_step_count % 5 == 0:  # 每5个DDPO步骤记录一次
+                    progress_pct = (self.iter / max_iter) * 100
+                    logger.info("3d"
+                                "2d")
+
+            # 每1000次迭代记录总体进度
+            if self.iter % 1000 == 0 and self.iter > 0:
+                elapsed_iters = self.iter - diffusion_warmup_iters
+                ddpo_freq = self.cfg.MODEL.RADM.DDPO_UPDATE_FREQ
+                expected_ddpo_steps = elapsed_iters // ddpo_freq
+                progress_pct = (self.iter / max_iter) * 100
+
+                logger.info("2d"
+                            "4d"
+                            "4d"
+                            "3.1f")
+
+        # 训练完成总结
+        logger.info("=" * 80)
+        logger.info("🎉 DDPO Training Completed Successfully!")
+        logger.info("=" * 80)
+        logger.info("📊 Training Summary:")
+        logger.info(f"  🔢 Total iterations: {max_iter:,}")
+        logger.info(f"  🌡️ Diffusion warmup: {diffusion_warmup_iters:,} iterations")
+        logger.info(f"  🤖 DDPO training: {max_iter - diffusion_warmup_iters:,} iterations")
+        logger.info(f"  📈 Total DDPO steps: {ddpo_step_count:,}")
+        logger.info(f"  🔄 DDPO update frequency: every {self.cfg.MODEL.RADM.DDPO_UPDATE_FREQ} iterations")
+        logger.info(f"  🎯 Final DDPO samples per step: {self.cfg.MODEL.RADM.DDPO_SAMPLE_SIZE}")
+        logger.info("=" * 80)
+        logger.info("💾 Model saved to: ./output_rl/")
+        logger.info("📈 Training logs available in the output directory")
+        logger.info("=" * 80)
+
+    def ddpo_step(self):
+        """
+        单步DDPO训练
+        """
+        import logging
+        logger = logging.getLogger("detectron2")
+        self.preference_model.train()
+
+        # 从训练数据中采样一个batch
+        try:
+            batch = next(iter(self.data_loader))
+        except StopIteration:
+            # 如果数据加载器耗尽，重新开始
+            self.data_loader_iter = iter(self.data_loader)
+            batch = next(iter(self.data_loader))
+
+        # DDPO在一个batch元素上操作，使用第一个元素
+        batch_item = batch[0]  # 单个batch元素 (dict)
+        batch_list = [batch_item]  # 包装成list以符合detectron2格式
+
+        # 预处理数据
+        images, images_whwh = self.model.preprocess_image(batch_list)
+
+        # 获取文本特征 (只处理第一个batch元素)
+        text_features = batch_item["text_fea"]['feats'].to(self.device).unsqueeze(0)  # [1, text_dim]
+        txt_mask = batch_item["text_mask"].to(self.device).unsqueeze(0)  # [1, seq_len]
+
+        # 获取ground truth奖励 (只处理第一个batch元素)
+        gt_instances = [batch_item["instances"].to(self.device)]
+        gt_rewards = self.compute_gt_rewards(gt_instances, images_whwh)
+
+        # 记录详细的奖励统计信息
+        reward_mean = gt_rewards.mean().item()
+        reward_std = gt_rewards.std().item()
+        reward_min = gt_rewards.min().item()
+        reward_max = gt_rewards.max().item()
+        logger.debug(f"🎯 DDPO Reward Statistics: "
+                        f"Mean={reward_mean:.4f}, Std={reward_std:.4f}, "
+                        f"Min={reward_min:.4f}, Max={reward_max:.4f}"
+                    )
+
+        # 使用真正的DDPO：采样时记录完整轨迹用于replay
+        logger.debug(f"🔄 DDPO sampling {self.ddpo_trainer.sample_size} layouts with trajectory recording...")
+        samples_with_trajectory = self.ddpo_trainer.sample_layouts_with_trajectory(
+            batch_list, text_features.squeeze(0), txt_mask.squeeze(0), num_samples=self.ddpo_trainer.sample_size
+        )
+        logger.debug(f"✅ DDPO sampling completed: {len(samples_with_trajectory)} samples with full trajectories")
+
+        # 计算DDPO损失 (使用replay模式比较同一个y在不同策略下的概率)
+        # 注意：传递正确的维度 - text_features [batch_size, text_dim], txt_mask [batch_size, seq_len]
+        logger.debug("🧮 Computing DDPO loss with preference model (replay mode)...")
+        ddpo_loss = self.ddpo_trainer.compute_ddpo_loss(
+            samples_with_trajectory, batch, text_features, txt_mask, gt_rewards,
+            chosen_indices=None, rejected_indices=None  # 暂时使用单样本模式
+        )
+        logger.debug(f"ddpo_loss.item() : {ddpo_loss}")
+
+        # 反向传播和优化
+        self.ddpo_optimizer.zero_grad()
+        ddpo_loss.backward()
+        self.ddpo_optimizer.step()
+
+    def compute_gt_rewards(self, gt_instances, images_whwh):
+        """
+        计算ground truth的奖励分数 (基于布局质量指标)
+        """
+        rewards = []
+        for i, instances in enumerate(gt_instances):
+            # instances是Instances对象，gt_boxes是tensor
+            if len(instances) == 0:
+                reward = 0.0
+            else:
+                # instances.gt_boxes 是 Boxes 对象，需要 .tensor 获取底层tensor
+                boxes_tensor = instances.gt_boxes.tensor  # [num_boxes, 4] (x1, y1, x2, y2)
+
+                # 计算每个bbox的面积
+                widths = boxes_tensor[:, 2] - boxes_tensor[:, 0]  # x2 - x1
+                heights = boxes_tensor[:, 3] - boxes_tensor[:, 1]  # y2 - y1
+                areas = widths * heights
+
+                # 计算平均面积 (归一化到图像尺寸)
+                img_area = images_whwh[i][0] * images_whwh[i][1]  # 图像面积 (w*h)
+                avg_area_ratio = (areas.mean().item() / img_area) if len(areas) > 0 else 0.0
+
+                # 奖励计算：基于bbox数量和相对面积
+                num_boxes = len(boxes_tensor)
+
+                # 数量奖励：鼓励适中的bbox数量 (5个左右最佳)
+                if num_boxes <= 5:
+                    count_reward = num_boxes * 0.2  # 0-1.0
+                else:
+                    count_reward = max(0, 2.0 - num_boxes * 0.1)  # 惩罚过多bbox
+
+                # 面积奖励：鼓励适中的bbox大小 (0.05-0.3的相对面积最佳)
+                if 0.05 <= avg_area_ratio <= 0.3:
+                    area_reward = 1.0
+                elif avg_area_ratio < 0.05:
+                    area_reward = avg_area_ratio / 0.05  # 太小惩罚
+                else:
+                    area_reward = max(0, 1.0 - (avg_area_ratio - 0.3) / 0.2)  # 太大惩罚
+
+                reward = (count_reward + area_reward) / 2.0  # 平均分数 0-1
+
+            rewards.append(reward)
+
+        return torch.tensor(rewards, device=self.device).unsqueeze(0).repeat(self.ddpo_trainer.sample_size, 1)
+
+    def results_to_layout_features(self, results, images_whwh):
+        """
+        将推理结果转换为布局特征表示
+        Args:
+            results: 推理结果列表，每个元素包含预测的boxes, scores, classes
+            images_whwh: 图像尺寸 [batch_size, 4] (w, h, w, h)
+        Returns:
+            layout_features: [batch_size, num_proposals, 4] 布局框坐标 (cx, cy, w, h)
+        """
+        batch_size = len(results)
+        num_proposals = self.model.num_proposals
+        layout_features = torch.zeros(batch_size, num_proposals, 4, device=self.device)
+
+        for i, result in enumerate(results):
+            if isinstance(result, dict) and "instances" in result:
+                instances = result["instances"]
+            else:
+                instances = result
+
+            if len(instances) > 0:
+                # 获取预测框 (x1, y1, x2, y2)
+                boxes = instances.pred_boxes.tensor  # [num_instances, 4]
+
+                # 转换为中心坐标格式 (cx, cy, w, h)
+                boxes_center = box_xyxy_to_cxcywh(boxes)  # [num_instances, 4]
+
+                # 归一化到0-1范围
+                img_whwh = images_whwh[i]  # [4] (w, h, w, h)
+                boxes_center = boxes_center / img_whwh[:4]
+
+                # 填充到固定大小
+                num_instances = min(len(boxes_center), num_proposals)
+                layout_features[i, :num_instances] = boxes_center[:num_instances]
+
+                # 剩余位置用零填充 (已经在初始化时完成)
+
+        return layout_features
     
 # add layout register
 def register_layout(cfg):
@@ -377,7 +651,11 @@ def main(args):
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
-    return trainer.train()
+
+    if cfg.MODEL.RADM.USE_DDPO:
+        return trainer.train_with_ddpo()
+    else:
+        return trainer.train()
 
 
 if __name__ == "__main__":

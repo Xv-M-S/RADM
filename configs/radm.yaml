@@ -10,6 +10,10 @@ MODEL:
     NUM_CLASSES: 4
     NMS_THRESH: 0.15
     CLASS_THRESH: 0.25
+    USE_DDPO: True
+    DDPO_BETA: 0.1
+    DDPO_SAMPLE_SIZE: 4
+    DDPO_UPDATE_FREQ: 10
 DATASETS:
   TEXT_FEATURE_PATH: '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset/text_features'
   DATASET_PATH: '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset'
@@ -22,5 +26,5 @@ INPUT:
   CROP:
     ENABLED: False
   FORMAT: "RGB"
-OUTPUT_DIR: "./output"
+OUTPUT_DIR: "./output_rl"
 

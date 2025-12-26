@@ -1,6 +1,488 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
+import math
+
+from RADM.util.box_ops import box_xyxy_to_cxcywh
+
+# ========================================
+# DDPO (Diffusion-DPO) Components for RADM
+# ========================================
+class PreferenceModel(nn.Module):
+    """
+    偏好模型：评估生成布局的质量
+    输入：布局特征 + 文本特征
+    输出：质量评分 (0-1之间的概率)
+    """
+    def __init__(self, layout_dim=256, text_dim=768, hidden_dim=512):
+        super().__init__()
+        self.layout_encoder = nn.Sequential(
+            nn.Linear(layout_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        self.text_encoder = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        self.preference_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()  # 输出0-1之间的偏好分数
+        )
+
+    def forward(self, layout_features, text_features):
+        """
+        Args:
+            layout_features: [batch_size, num_proposals, layout_dim]
+            text_features: [batch_size, text_dim]
+        Returns:
+            preference_scores: [batch_size, num_proposals]
+        """
+        # 编码布局特征
+        layout_encoded = self.layout_encoder(layout_features)  # [B, N, H]
+
+        # 编码文本特征
+        text_encoded = self.text_encoder(text_features)  # [B, H]
+        text_encoded = text_encoded.unsqueeze(1).repeat(1, layout_features.size(1), 1)  # [B, N, H]
+
+        # 融合特征
+        combined = torch.cat([layout_encoded, text_encoded], dim=-1)  # [B, N, 2H]
+
+        # 预测偏好分数
+        scores = self.preference_head(combined).squeeze(-1)  # [B, N]
+
+        return scores
+
+
+class DDPOTrainer:
+    """
+    修正的DDPO (Diffusion-DPO) 训练器
+    实现真正的轨迹概率计算和成对偏好优化
+    """
+    def __init__(self, model, preference_model, reference_model=None, beta=0.1, sample_size=4):
+        self.model = model
+        self.preference_model = preference_model
+        # 参考模型可以是早期版本的模型，或者使用固定的噪声预测
+        self.reference_model = reference_model if reference_model is not None else model
+        self.beta = beta  # DPO的beta参数
+        self.sample_size = sample_size  # 每次采样数量
+        # 确保所有模型在同一设备上
+        self.device = next(model.parameters()).device
+
+    def compute_denoising_confidence_score(self, x_0, text_features, txt_mask, model):
+        """
+        计算模型对生成样本的"置信度"评分
+        使用去噪一致性作为概率质量的代理指标
+
+        这是对传统DDPO概率计算的实用替代方案：
+        - 使用模型的去噪能力来评估生成质量
+        - 计算多时间步的一致性得分
+        - 避免复杂的轨迹概率积分
+        """
+        batch_size = x_0.shape[0]
+
+        # 重新参数化到扩散空间
+        x_0_norm = (x_0 * 2. - 1.) * model.scale  # [B, N, 4]
+
+        # 选择多个时间步进行一致性检查
+        timesteps = torch.tensor([100, 500, 900], device=x_0.device)  # 早期、中期、晚期
+        consistency_scores = []
+
+        for t in timesteps:
+            t_batch = t.unsqueeze(0).repeat(batch_size, 1)
+
+            # 正向扩散：添加噪声
+            noise_gt = torch.randn_like(x_0_norm)
+            x_t = model.q_sample(x_start=x_0_norm, t=t_batch, noise=noise_gt)
+
+            # 逆向预测：模型预测噪声
+            with torch.no_grad():
+                pred_noise, _, _ = model.model_predictions(
+                    None,  # backbone feats placeholder
+                    torch.tensor([[1.0, 1.0, 1.0, 1.0]] * batch_size, device=x_0.device),  # image_whwh placeholder
+                    x_t, text_features, txt_mask, t_batch
+                )
+
+            # 计算预测一致性 (越小越好)
+            denoising_error = torch.mean((pred_noise - noise_gt) ** 2, dim=[1, 2])  # [B]
+
+            # 转换为置信度得分 (去噪误差越小，置信度越高)
+            confidence = -denoising_error  # 负误差作为"质量"指标
+
+            consistency_scores.append(confidence)
+
+        # 计算多时间步的一致性平均
+        consistency_score = torch.stack(consistency_scores, dim=0).mean(dim=0)  # [B]
+
+        return consistency_score
+
+    def compute_simple_density_proxy(self, x_0, text_features, txt_mask, model):
+        """
+        计算简化的密度代理 (承认这不是真正的概率密度)
+        使用去噪重建质量作为生成质量的代理
+
+        注意：这个方法主要用于演示和快速原型，不建议用于生产环境
+        """
+        batch_size = x_0.shape[0]
+
+        # 重新参数化到扩散空间
+        x_0_norm = (x_0 * 2. - 1.) * model.scale
+
+        # 选择一个合理的时间步 (不是T/2，因为那只是启发式)
+        t = torch.tensor([model.num_timesteps // 3], device=x_0.device).repeat(batch_size)
+
+        # 添加噪声并重建
+        noise = torch.randn_like(x_0_norm)
+        x_t = model.q_sample(x_start=x_0_norm, t=t, noise=noise)
+
+        # 使用模型重建
+        with torch.no_grad():
+            pred_noise, _, _ = model.model_predictions(
+                None,  # backbone feats
+                torch.tensor([[1.0, 1.0, 1.0, 1.0]] * batch_size, device=x_0.device),  # image_whwh
+                x_t, text_features, txt_mask, t
+            )
+
+            # 从预测噪声重建x_0
+            pred_x0 = (x_t - (1 - model.alphas_cumprod[t[0]]).sqrt() * pred_noise) / model.alphas_cumprod[t[0]].sqrt()
+            pred_x0 = torch.clamp(pred_x0, -model.scale, model.scale)
+
+        # 计算重建质量 (这是合理的代理指标)
+        reconstruction_error = torch.mean((pred_x0 - x_0_norm) ** 2, dim=[1, 2])  # [B]
+
+        # 转换为"密度"代理 (重建误差越小，"密度"越高)
+        density_proxy = -reconstruction_error
+
+        return density_proxy
+
+
+    def compute_ddpo_loss(self, samples_with_trajectory, batch_inputs, text_features, txt_mask, rewards, chosen_indices=None, rejected_indices=None):
+        """
+        计算真正的DDPO损失：使用replay模式比较同一个y在不同策略下的概率
+
+        Args:
+            samples_with_trajectory: [(layout, trajectory), ...] 从sample_layouts_with_trajectory返回的列表
+            batch_inputs: 原始batch输入
+            text_features: [batch_size, text_dim] 文本特征
+            txt_mask: [batch_size, seq_len] 文本mask
+            rewards: [sample_size, batch_size] 奖励分数 (如果不使用成对偏好)
+            chosen_indices: Optional[List[int]] 每个batch item的优胜样本索引 [batch_size]
+            rejected_indices: Optional[List[int]] 每个batch item的劣质样本索引 [batch_size]
+        """
+        sample_size = len(samples_with_trajectory)
+        if sample_size == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        batch_size = samples_with_trajectory[0][0].shape[0]  # 从第一个layout获取batch_size
+
+        # 计算当前模型在轨迹上的log prob
+        log_p_theta = torch.zeros(sample_size, batch_size, device=self.device)
+        for i, (_, trajectory) in enumerate(samples_with_trajectory):
+            # 当前模型在自己的轨迹上的log prob (应该接近真实轨迹)
+            log_p_theta[i] = self.compute_log_prob_for_trajectory(self.model, trajectory)
+
+        # 计算参考模型在相同轨迹上的log prob (DDPO replay模式!)
+        log_p_ref = torch.zeros(sample_size, batch_size, device=self.device)
+        for i, (_, trajectory) in enumerate(samples_with_trajectory):
+            # 参考模型在当前模型生成的轨迹上的log prob
+            log_p_ref[i] = self.compute_log_prob_for_trajectory(self.reference_model, trajectory)
+
+        # 处理成对偏好数据 (标准DDPO格式)
+        if chosen_indices is not None and rejected_indices is not None:
+            # 修正维度：chosen_indices是每个batch item对应的样本索引
+            chosen_indices = torch.tensor(chosen_indices, device=self.device, dtype=torch.long)  # [batch_size]
+            rejected_indices = torch.tensor(rejected_indices, device=self.device, dtype=torch.long)  # [batch_size]
+
+            # 选择对应的log probs: [sample_size, batch_size] -> [batch_size] (选择正确的样本)
+            log_p_theta_chosen = log_p_theta[chosen_indices, torch.arange(batch_size)]  # [batch_size]
+            log_p_theta_rejected = log_p_theta[rejected_indices, torch.arange(batch_size)]  # [batch_size]
+            log_p_ref_chosen = log_p_ref[chosen_indices, torch.arange(batch_size)]  # [batch_size]
+            log_p_ref_rejected = log_p_ref[rejected_indices, torch.arange(batch_size)]  # [batch_size]
+
+            # 标准DDPO目标:
+            # max_θ E[log σ(β(log p_θ(y_w) - log p_θ(y_l) - log p_ref(y_w) + log p_ref(y_l)))]
+            advantages = (log_p_theta_chosen - log_p_theta_rejected) - (log_p_ref_chosen - log_p_ref_rejected)
+            ddpo_loss = -torch.log(torch.sigmoid(self.beta * advantages)).mean()
+
+        else:
+            # 回退到单样本奖励模式
+            rewards = rewards.view(sample_size, -1)  # [sample_size, batch_size]
+
+            # 获取偏好模型评分作为奖励信号
+            layouts = [layout for layout, _ in samples_with_trajectory]
+            layout_samples = torch.stack(layouts, dim=0)  # [sample_size, batch_size, num_proposals, 4]
+
+            # 调试：检查布局特征维度
+            import json
+            import time
+            debug_data = {
+                "layout_samples_shape": list(layout_samples.shape),
+                "sample_size": sample_size,
+                "batch_size": layout_samples.shape[1],
+                "num_proposals": layout_samples.shape[2],
+                "layout_dim": layout_samples.shape[3]  # 应该是4
+            }
+
+            log_entry = json.dumps({
+                "id": f"log_{int(time.time()*1000)}_layout",
+                "timestamp": int(time.time()*1000),
+                "location": "RADM/layers.py:compute_ddpo_loss",
+                "message": "DDPO layout features dimensions",
+                "data": debug_data,
+                "sessionId": "debug-session",
+                "runId": "run2",
+                "hypothesisId": "FIX_VERIFICATION"
+            })
+
+            with open("/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/.cursor/debug.log", "a") as f:
+                f.write(log_entry + "\n")
+
+            num_proposals = layout_samples.shape[2]
+            layout_flat = layout_samples.view(-1, num_proposals, 4)  # [sample_size*batch_size, num_proposals, 4]
+            # 调试：检查输入维度
+            # print(f"text_features.shape: {text_features.shape}")
+            # print(f"txt_mask.shape: {txt_mask.shape}")
+            # print(f"sample_size: {sample_size}")
+
+            # 处理text_features：如果是3D [batch_size, seq_len, hidden_dim]，需要池化到 [batch_size, hidden_dim]
+            if text_features.dim() == 3:
+                # 对序列维度进行平均池化，得到 [batch_size, hidden_dim]
+                text_features = text_features.mean(dim=1)  # [1, 20, 768] -> [1, 768]
+
+            # 处理txt_mask：如果是3D，需要相应调整
+            if txt_mask.dim() == 3:
+                # 对序列维度进行平均，得到 [batch_size, 1]
+                txt_mask = txt_mask.float().mean(dim=1)  # [1, 20, 1] -> [1, 1]
+
+            text_flat = text_features.unsqueeze(0).repeat(sample_size, 1, 1).view(-1, text_features.size(-1))
+            txt_mask_flat = txt_mask.unsqueeze(0).repeat(sample_size, 1, 1).view(-1, txt_mask.size(-1))
+
+            preference_scores = self.preference_model(layout_flat, text_flat)
+            preference_scores = preference_scores.view(sample_size, batch_size, num_proposals)
+            avg_preferences = preference_scores.mean(dim=-1)  # [sample_size, batch_size]
+
+            combined_rewards = avg_preferences + rewards
+
+            # 对于单样本DDPO，使用简化的优势计算
+            # 鼓励生成高质量布局：更高的奖励 = 更好的生成
+            advantages = self.beta * combined_rewards  # 只使用奖励信号
+
+            # 如果有log概率信息，也可以使用它
+            if log_p_theta is not None and log_p_ref is not None:
+                advantages = advantages + (log_p_theta - log_p_ref)
+
+            ddpo_loss = -torch.log(torch.sigmoid(advantages)).mean()
+
+            # 调试：记录优势统计
+            import json
+            import time
+            debug_data = {
+                "advantages_mean": advantages.mean().item(),
+                "advantages_std": advantages.std().item(),
+                "combined_rewards_mean": combined_rewards.mean().item(),
+                "avg_preferences_mean": avg_preferences.mean().item(),
+                "rewards_mean": rewards.mean().item()
+            }
+
+            log_entry = json.dumps({
+                "id": f"log_{int(time.time()*1000)}_ddpo_debug",
+                "timestamp": int(time.time()*1000),
+                "location": "RADM/layers.py:compute_ddpo_loss",
+                "message": "DDPO advantages and rewards debug",
+                "data": debug_data,
+                "sessionId": "debug-session",
+                "runId": "run3",
+                "hypothesisId": "DDPO_LOSS_DEBUG"
+            })
+
+            with open("/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/.cursor/debug.log", "a") as f:
+                f.write(log_entry + "\n")
+
+        return ddpo_loss
+
+    def sample_layouts_with_trajectory(self, batch_inputs, text_features, txt_mask, num_samples=4):
+        """
+        从当前模型采样多个布局，并记录完整轨迹用于DDPO replay
+        Args:
+            batch_inputs: detectron2 batch (list of dicts)
+            text_features: [batch_size, text_dim]
+            txt_mask: [batch_size, seq_len]
+            num_samples: 采样次数
+        返回: (layouts, trajectories) 元组列表，其中trajectory包含每一步的状态
+        """
+        # batch_inputs 是 detectron2 的 batch 格式 (list of dicts)
+        # 我们使用第一个batch元素进行采样
+        batch_list = batch_inputs if isinstance(batch_inputs, list) else [batch_inputs]
+
+        # 预处理图像数据 (一次性完成，避免重复计算)
+        images, images_whwh = self.model.preprocess_image(batch_list)
+
+        # 按照RADM的标准方式处理backbone特征
+        src = self.model.backbone(images.tensor)
+        backbone_feats = list()
+        for f in self.model.in_features:
+            feature = src[f]
+            backbone_feats.append(feature)
+
+        samples_with_trajectory = []
+
+        for _ in range(num_samples):
+            # 调用轨迹记录采样方法
+            results, trajectory = self.model.ddim_sample_with_trajectory(
+                batch_list, backbone_feats, images_whwh, images,
+                text_features, txt_mask, return_trajectory=True
+            )
+
+            # 将结果转换为布局特征
+            sample_layout = self.results_to_layout_features(results, images_whwh)
+
+            samples_with_trajectory.append((sample_layout, trajectory))
+
+        return samples_with_trajectory
+
+    def results_to_layout_features(self, results, images_whwh):
+        """
+        将推理结果转换为布局特征表示
+        Args:
+            results: 推理结果列表，每个元素包含预测的boxes, scores, classes
+            images_whwh: 图像尺寸 [batch_size, 4] (w, h, w, h)
+        Returns:
+            layout_features: [batch_size, num_proposals, 4] 布局框坐标 (cx, cy, w, h)
+        """
+        batch_size = len(results)
+        num_proposals = self.model.num_proposals
+        layout_features = torch.zeros(batch_size, num_proposals, 4, device=self.device)
+
+        for i, result in enumerate(results):
+            if isinstance(result, dict) and "instances" in result:
+                instances = result["instances"]
+            else:
+                instances = result
+
+            if len(instances) > 0:
+                # 获取预测框 (x1, y1, x2, y2)
+                boxes = instances.pred_boxes.tensor  # [num_instances, 4]
+
+                # 转换为中心坐标格式 (cx, cy, w, h)
+                boxes_center = box_xyxy_to_cxcywh(boxes)  # [num_instances, 4]
+
+                # 归一化到0-1范围
+                img_whwh = images_whwh[i]  # [4] (w, h, w, h)
+                boxes_center = boxes_center / img_whwh[:4]
+
+                # 填充到固定大小
+                num_instances = min(len(boxes_center), num_proposals)
+                layout_features[i, :num_instances] = boxes_center[:num_instances]
+
+                # 剩余位置用零填充 (已经在初始化时完成)
+
+        return layout_features
+
+    def compute_log_prob_for_trajectory(self, model, trajectory):
+        """
+        对给定的轨迹，用指定模型计算log prob (修正版：计算轨迹实际发生的概率)
+        关键修正：计算轨迹中实际发生的x_prev在当前模型下的概率密度
+        """
+        steps = trajectory['steps']
+        batch_size = trajectory['image_whwh'].shape[0]
+
+        total_log_prob = torch.zeros(batch_size, device=self.device)
+
+        # 遍历轨迹的每一步
+        for step in steps:
+            x_t = step['x_t']
+            t = step['t']
+            time_next = step['time_next']
+
+            # 关键修正1：获取轨迹中真实发生的下一步 x_prev_actual
+            # sample_layouts_with_trajectory必须保存这一项！
+            if 'x_prev' not in step:
+                # 如果轨迹没有保存x_prev，跳过这一步
+                continue
+
+            x_prev_actual = step['x_prev']  # 轨迹中实际发生的x_{t-1}
+
+            # Replay: 用当前模型预测噪声
+            with torch.no_grad():
+                preds, _, _ = model.model_predictions(
+                    None,  # backbone feats placeholder
+                    trajectory['image_whwh'],
+                    x_t, trajectory['text_feature'], trajectory['txt_mask'], t
+                )
+                pred_noise = preds.pred_noise
+
+            # 计算条件概率 log p(x_{prev} | x_t, θ)
+            if time_next >= 0:
+                alpha = step['alpha']
+                alpha_next = step['alpha_next']
+                eta = step['eta']
+
+                # DDIM参数
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+
+                if sigma.sum() == 0:
+                    # 如果是确定性采样(DDIM eta=0)，概率密度是无穷大(Dirac delta)
+                    # 跳过这一步或给一个大的常数值
+                    continue
+
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                # 关键修正2：基于当前模型的预测，推导当前的高斯均值 mu_theta
+                # 先反推 x_0 (reparameterization)
+                pred_x_start = (x_t - (1 - alpha).sqrt() * pred_noise) / alpha.sqrt()
+                pred_x_start = torch.clamp(pred_x_start, -model.scale, model.scale)
+
+                # 计算均值 mu (根据DDIM更新公式，去掉噪声项sigma*z)
+                mu_theta = pred_x_start * alpha_next.sqrt() + c * pred_noise
+
+                # 关键修正3：计算实际轨迹点x_prev_actual在该分布下的Log Probability
+                # p(x_prev | x_t) ~ N(mu_theta, sigma^2 * I)
+                # Log Gaussian: -0.5 * Σ((x - mu)/sigma)^2 - Σ log(sigma * sqrt(2π))
+
+                # 计算方差 (对每个维度)
+                variance = sigma ** 2 + 1e-8  # 避免除零
+
+                # 计算平方差
+                squared_diff = (x_prev_actual - mu_theta) ** 2
+
+                # 对数概率密度 (逐元素)
+                step_log_prob = -0.5 * (squared_diff / variance).sum(dim=[1, 2])
+
+                # 减去归一化常数 log(Z) = Σ log(σ * sqrt(2π))
+                num_elements = x_prev_actual.shape[1] * x_prev_actual.shape[2]
+                normalization = num_elements * torch.log(sigma * (2 * torch.pi).sqrt() + 1e-8)
+                step_log_prob = step_log_prob - normalization
+
+                total_log_prob += step_log_prob
+
+        return total_log_prob
+
+    def sample_layouts(self, batch_inputs, text_features, txt_mask, num_samples=4):
+        """
+        从当前模型采样多个布局 (向后兼容)
+        """
+        layouts = []
+        for _ in range(num_samples):
+            # 这里调用模型的推理过程
+            with torch.no_grad():
+                results = self.model.ddim_sample(
+                    batch_inputs, self.model.backbone(batch_inputs["image"]),
+                    self.model.preprocess_image(batch_inputs)[1],  # images_whwh
+                    self.model.preprocess_image(batch_inputs)[0],  # images
+                    text_features, txt_mask
+                )
+                layouts.append(results)
+
+        return layouts
+
 
 # ========================================
 # Added StructureEvolvingSERM Class

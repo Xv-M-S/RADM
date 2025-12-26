@@ -62,6 +62,14 @@ def add_radm_config(cfg):
     # Inference
     cfg.MODEL.RADM.USE_NMS = True
 
+    # DDPO (Diffusion-DPO) Settings
+    cfg.MODEL.RADM.USE_DDPO = True
+    cfg.MODEL.RADM.DDPO_HIDDEN_DIM = 512
+    cfg.MODEL.RADM.DDPO_BETA = 0.1
+    cfg.MODEL.RADM.DDPO_SAMPLE_SIZE = 4
+    cfg.MODEL.RADM.DDPO_LR = 1e-4
+    cfg.MODEL.RADM.DDPO_UPDATE_FREQ = 10
+
     # Optimizer.
     cfg.SOLVER.OPTIMIZER = "ADAMW"
     cfg.SOLVER.BACKBONE_MULTIPLIER = 1.0
