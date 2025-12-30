@@ -259,7 +259,9 @@ if __name__ == "__main__":
     test_label = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/RADM/dataSets/RADM_dataset/annotations/test.json'
     # test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_serm/inference/coco_instances_results.json'
     # test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_dual_stream_serm/inference/coco_instances_results.json'
-    test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_dual_gram/inference/coco_instances_results.json'
+    # test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_dual_gram/inference/coco_instances_results.json'
+    # test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_gnn/inference/coco_instances_results.json'
+    test_annotation = '/home/sxm/flux-workspace/text-to-layout-zhuanlan/BASE-RADM/RADM/output_gnn_mask_v2/inference/coco_instances_results.json'
     vis_example = './vis_example/'
     main(test_label, test_annotation, test_imgdir, vis_example)
     

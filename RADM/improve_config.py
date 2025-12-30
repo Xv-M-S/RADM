@@ -1,9 +1,9 @@
 
 class Config:
-    TASI_ENABLED = True
+    TASI_ENABLED = False
     SERM = False
     DUAL_STREAM_SERM = False
-    DUAL_GTRAM = True
+    DUAL_GTRAM = False
     SERM_K = 5
 
     # 禁止运行时覆盖

@@ -32,7 +32,21 @@ class StructureEvolvingSERM(nn.Module):
     def build_dynamic_knn_mask(self, rois):
         B, N, _ = rois.shape
         centers = rois[:, :, :2]
+        
+        # 检测padding节点：坐标为-1e5的节点是padding
+        padding_mask = torch.all(torch.abs(rois) > 1e4, dim=-1)  # [B, N]
+        
+        # 创建距离矩阵时，将padding节点与其他节点的距离设为无穷大
         dist_matrix = torch.cdist(centers, centers, p=2)
+        
+        # 将padding节点的距离设为无穷大，这样它们就不会被选入KNN
+        for b in range(B):
+            padding_indices = torch.where(padding_mask[b])[0]
+            if len(padding_indices) > 0:
+                # 将padding节点与所有节点的距离设为无穷大
+                dist_matrix[b, padding_indices, :] = float('inf')
+                dist_matrix[b, :, padding_indices] = float('inf')
+        
         k_val = min(self.k + 1, N)
         _, knn_indices = dist_matrix.topk(k_val, dim=-1, largest=False)
 
@@ -46,6 +60,15 @@ class StructureEvolvingSERM(nn.Module):
         # Visual Hierarchy
         mask[:, :, 0] = 0.0
         mask[:, 0, :] = 0.0
+        
+        # 确保padding节点不会与其他节点建立连接
+        for b in range(B):
+            padding_indices = torch.where(padding_mask[b])[0]
+            if len(padding_indices) > 0:
+                # 屏蔽padding节点作为查询时的所有连接
+                mask[b, padding_indices, :] = float('-inf')
+                # 屏蔽padding节点作为键时的所有连接
+                mask[b, :, padding_indices] = float('-inf')
 
         # 扩展到 head 维度
         mask = mask.repeat_interleave(self.nhead, dim=0)  # (B * nhead, N, N)
@@ -121,6 +144,9 @@ class DualStreamSERM(nn.Module):
         Returns:
             fused_dist: [B, N, N] -> 融合后的距离矩阵，值越小代表越相关
         """
+        # 检测padding节点：坐标为-1e5的节点是padding
+        padding_mask = torch.all(torch.abs(rois) > 1e4, dim=-1)  # [B, N]
+        
         # --- Stream 1: Geometric Distance ---
         centers = rois[:, :, :2]
         # 计算欧氏距离 [B, N, N]
@@ -150,6 +176,15 @@ class DualStreamSERM(nn.Module):
         # 导致 fused_dist 变大，从而不会被选入 Top-K。
         fused_dist = self.alpha * geo_dist_norm + (1 - self.alpha) * sem_dist_norm
         
+        # 将padding节点与其他节点的距离设为无穷大
+        B, N, _ = rois.shape
+        for b in range(B):
+            padding_indices = torch.where(padding_mask[b])[0]
+            if len(padding_indices) > 0:
+                # 将padding节点与所有节点的距离设为无穷大
+                fused_dist[b, padding_indices, :] = float('inf')
+                fused_dist[b, :, padding_indices] = float('inf')
+        
         return fused_dist
 
     def build_dual_stream_mask(self, rois, features):
@@ -157,6 +192,9 @@ class DualStreamSERM(nn.Module):
         基于融合距离构建 Mask
         """
         B, N, _ = rois.shape
+        
+        # 检测padding节点：坐标为-1e5的节点是padding
+        padding_mask = torch.all(torch.abs(rois) > 1e4, dim=-1)  # [B, N]
         
         # 1. 计算双流融合距离
         # 如果是 Inference 阶段且 N 很大 (Flatten过)，可能需要先 view 回去，
@@ -178,6 +216,15 @@ class DualStreamSERM(nn.Module):
         # [Global Connection]
         mask[:, :, 0] = 0.0
         mask[:, 0, :] = 0.0
+        
+        # 确保padding节点不会与其他节点建立连接
+        for b in range(B):
+            padding_indices = torch.where(padding_mask[b])[0]
+            if len(padding_indices) > 0:
+                # 屏蔽padding节点作为查询时的所有连接
+                mask[b, padding_indices, :] = float('-inf')
+                # 屏蔽padding节点作为键时的所有连接
+                mask[b, :, padding_indices] = float('-inf')
         
         # 4. 扩展维度
         mask = mask.repeat_interleave(self.nhead, dim=0)

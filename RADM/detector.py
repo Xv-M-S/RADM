@@ -21,7 +21,7 @@ from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, detector_pos
 
 from detectron2.structures import Boxes, ImageList, Instances
 
-from .loss import SetCriterionDynamicK, HungarianMatcherDynamicK
+from .loss import SetCriterionDynamicK, HungarianMatcherDynamicK, SequentialMatcher
 from .head import DynamicHead
 from .util.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 from .util.misc import nested_tensor_from_tensor_list
@@ -215,9 +215,10 @@ class RADM(nn.Module):
         self.nms_threshold = cfg.MODEL.RADM.NMS_THRESH
         self.threshold = cfg.MODEL.RADM.CLASS_THRESH
         # Build Criterion.
-        matcher = HungarianMatcherDynamicK(
-            cfg=cfg, cost_class=class_weight, cost_bbox=l1_weight, cost_giou=giou_weight, use_focal=self.use_focal
-        )
+        # matcher = HungarianMatcherDynamicK(
+        #     cfg=cfg, cost_class=class_weight, cost_bbox=l1_weight, cost_giou=giou_weight, use_focal=self.use_focal
+        # )
+        matcher = SequentialMatcher()
         weight_dict = {"loss_ce": class_weight, "loss_bbox": l1_weight, "loss_giou": giou_weight}
         if self.deep_supervision:
             aux_weight_dict = {}
@@ -317,8 +318,12 @@ class RADM(nn.Module):
                   sigma * noise
 
             if self.box_renewal:  # filter
-                # replenish with randn boxes
-                img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device = img.device)), dim=1)
+                # replenish with special value boxes for padding instead of random boxes
+                if num_remain < self.num_proposals:
+                    # 使用特殊值(-1e5)作为padding的标记
+                    pad_boxes = torch.full((1, self.num_proposals - num_remain, 4),
+                                           -1e5, device=img.device)
+                    img = torch.cat((img, pad_boxes), dim=1)
             if self.use_ensemble and self.sampling_timesteps > 1:
                 box_pred_per_image, scores_per_image, labels_per_image = self.inference(outputs_class[-1],
                                                                                         outputs_coord[-1],
@@ -419,14 +424,46 @@ class RADM(nn.Module):
             norm_x_boxes = x_boxes.to(torch.float32)
             #norm_x_boxes = torch.clamp(norm_x_boxes, min=0, max=1)
             x_boxes = x_boxes * images_whwh[:, None, :]
-            
+
             outputs_class, outputs_coord = self.head(features, x_boxes, norm_x_boxes, text_features,  txt_mask, t, None)
-            
+
+            # 应用物理mask：对padding位置的输出进行mask
+            batch_size = len(targets)
+            for b in range(batch_size):
+                physical_mask = targets[b]["physical_mask"]  # [num_proposals] bool tensor
+                if not physical_mask.all():  # 如果有padding节点
+                    # 对分类输出进行mask：padding位置设为背景类（最后一类）
+                    # 使用out-of-place操作避免view修改错误
+                    outputs_class[-1] = outputs_class[-1].clone()
+                    outputs_coord[-1] = outputs_coord[-1].clone()
+
+                    # 使用大的有限值而不是inf，避免数值不稳定
+                    # 背景类logits设为大的正值，其他类设为大的负值
+                    outputs_class[-1][b, ~physical_mask, -1] = 100.0  # 背景类logits
+                    outputs_class[-1][b, ~physical_mask, :-1] = -100.0  # 其他类logits
+
+                    # 对bbox输出进行mask：padding位置设为默认值
+                    default_bbox = torch.tensor([0.5, 0.5, 0.5, 0.5], device=self.device)  # 中心位置，默认大小
+                    outputs_coord[-1][b, ~physical_mask] = default_bbox
+
             output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
 
             if self.deep_supervision:
-                output['aux_outputs'] = [{'pred_logits': a, 'pred_boxes': b}
-                                         for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+                aux_outputs = []
+                for a, b in zip(outputs_class[:-1], outputs_coord[:-1]):
+                    # 对辅助输出也应用相同的mask
+                    a = a.clone()  # 克隆以避免view修改错误
+                    b = b.clone()  # 克隆以避免view修改错误
+                    for batch_idx in range(batch_size):
+                        physical_mask = targets[batch_idx]["physical_mask"]
+                        if not physical_mask.all():
+                            # 使用大的有限值而不是inf，避免数值不稳定
+                            a[batch_idx, ~physical_mask, -1] = 100.0  # 背景类logits
+                            a[batch_idx, ~physical_mask, :-1] = -100.0  # 其他类logits
+                            default_bbox = torch.tensor([0.5, 0.5, 0.5, 0.5], device=self.device)
+                            b[batch_idx, ~physical_mask] = default_bbox
+                    aux_outputs.append({'pred_logits': a, 'pred_boxes': b})
+                output['aux_outputs'] = aux_outputs
 
             loss_dict = self.criterion(output, targets)
             weight_dict = self.criterion.weight_dict
@@ -468,7 +505,7 @@ class RADM(nn.Module):
 
         return diff_boxes, noise, t
 
-    def prepare_diffusion_concat(self, gt_boxes):
+    def prepare_diffusion_concat(self, gt_boxes, physical_mask=None):
         """
         :param gt_boxes: (cx, cy, w, h), normalized
         :param num_proposals:
@@ -482,9 +519,10 @@ class RADM(nn.Module):
             num_gt = 1
 
         if num_gt < self.num_proposals:
-            box_placeholder = torch.randn(self.num_proposals - num_gt, 4,
-                                          device=self.device) / 6. + 0.5  # 3sigma = 1/2 --> sigma: 1/6
-            box_placeholder[:, 2:] = torch.clip(box_placeholder[:, 2:], min=1e-4)
+            # 对于padding节点，使用特殊值标记，让模型能够识别并忽略这些padding部分
+            # 使用一个超出正常范围的小值(-1e5)作为padding的特殊值
+            box_placeholder = torch.full((self.num_proposals - num_gt, 4),
+                                           -1e5, device=self.device)
             x_start = torch.cat((gt_boxes, box_placeholder), dim=0)
         elif num_gt > self.num_proposals:
             select_mask = [True] * self.num_proposals + [False] * (num_gt - self.num_proposals)
@@ -523,7 +561,17 @@ class RADM(nn.Module):
             gt_classes = targets_per_image.gt_classes
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
-            d_boxes, d_noise, d_t = self.prepare_diffusion_concat(gt_boxes)
+
+            # 记录有效节点数量和mask信息
+            num_valid = len(gt_boxes)
+            target["num_valid"] = num_valid
+
+            # 创建物理mask：前num_valid个为True（有效），其余为False（padding）
+            physical_mask = torch.zeros(self.num_proposals, dtype=torch.bool, device=self.device)
+            physical_mask[:num_valid] = True
+            target["physical_mask"] = physical_mask
+
+            d_boxes, d_noise, d_t = self.prepare_diffusion_concat(gt_boxes, physical_mask)
             diffused_boxes.append(d_boxes)
             noises.append(d_noise)
             ts.append(d_t)

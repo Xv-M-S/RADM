@@ -81,6 +81,53 @@ class ContrastiveAlignmentLoss(nn.Module):
         # maximize attention on aligned pairs, minimize on others
         # 这里用简单的 MSE 即可证明有效性
         return loss * 10.0 # 权重系数，通常需要设大一点
+    
+
+
+
+# matcher.py
+class SequentialMatcher(nn.Module):
+    """
+    A matcher that matches the first min(len(pred), len(gt)) predictions
+    to the ground truth in sequential order (no Hungarian algorithm).
+    Assumes:
+        - predictions are already sorted by confidence or semantic order
+        - targets are provided in the desired matching order
+    """
+    def __init__(self):
+        super().__init__()
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """
+        outputs: dict with 'pred_logits', 'pred_boxes'
+        targets: list[dict], each with 'labels', 'boxes'
+
+        Returns:
+            indices: List[Tuple[Tensor, Tensor]] of (pred_idx, target_idx)
+        """
+        bs, num_pred = outputs["pred_logits"].shape[:2]
+        indices = []
+
+        for i in range(bs):
+            # 使用物理mask：只匹配有效节点（前num_valid个）
+            num_valid = targets[i].get("num_valid", len(targets[i]["labels"]))
+            if num_valid == 0:
+                # No valid ground truth: match nothing
+                indices.append((torch.empty(0, dtype=torch.long, device=outputs["pred_logits"].device),
+                               torch.empty(0, dtype=torch.long, device=outputs["pred_logits"].device)))
+                continue
+
+            # 只匹配前num_valid个预测框（有效节点）
+            k = min(num_pred, num_valid)
+            pred_indices = torch.arange(k, device=outputs["pred_logits"].device)
+            target_indices = torch.arange(k, device=outputs["pred_logits"].device)
+
+            indices.append((pred_indices, target_indices))
+
+        return indices, None  # second return is unused in your criterion
+    
+
 
 class SetCriterionDynamicK(nn.Module):
     """ This class computes the loss for RADM.
@@ -190,12 +237,25 @@ class SetCriterionDynamicK(nn.Module):
             gt_classes = torch.argmax(target_classes_onehot, dim=-1)
             target_classes_onehot = target_classes_onehot[:, :, :-1]
 
+            # 创建有效节点mask：只对匹配的节点计算损失
+            valid_mask = torch.zeros(src_logits.shape[:2], dtype=torch.bool, device=src_logits.device)
+            for batch_idx in range(batch_size):
+                valid_query = indices[batch_idx][0]
+                if len(valid_query) > 0:
+                    valid_mask[batch_idx, valid_query] = True
+
             src_logits = src_logits.flatten(0, 1)
             target_classes_onehot = target_classes_onehot.flatten(0, 1)
+            valid_mask_flat = valid_mask.flatten(0, 1)
+
             if self.use_focal:
                 cls_loss = sigmoid_focal_loss_jit(src_logits, target_classes_onehot, alpha=self.focal_loss_alpha, gamma=self.focal_loss_gamma, reduction="none")
             else:
                 cls_loss = F.binary_cross_entropy_with_logits(src_logits, target_classes_onehot, reduction="none")
+
+            # 只对有效节点计算损失
+            cls_loss = cls_loss * valid_mask_flat.unsqueeze(-1).float()
+
             if self.use_fed_loss:
                 K = self.num_classes
                 N = src_logits.shape[0]
