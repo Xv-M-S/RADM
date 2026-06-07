@@ -401,7 +401,8 @@ class DynamicHead(nn.Module):
         )
         return box_pooler
 
-    def forward(self, features, init_bboxes, norm_bboxes, txt_features, txt_mask, t, init_features):
+    def forward(self, features, init_bboxes, norm_bboxes, txt_features, txt_mask, t, init_features,
+                H_topo_list=None, H_geo_list=None):
         # assert t shape (batch_size)
         time = self.time_mlp(t)
 
@@ -419,7 +420,8 @@ class DynamicHead(nn.Module):
             proposal_features = None
         
         for head_idx, rcnn_head in enumerate(self.head_series):
-            class_logits, pred_bboxes, proposal_features = rcnn_head(features, bboxes, norm_bboxes, txt_features, txt_mask, proposal_features, self.box_pooler, time)
+            class_logits, pred_bboxes, proposal_features = rcnn_head(features, bboxes, norm_bboxes, txt_features, txt_mask, proposal_features, self.box_pooler, time,
+                                                                      H_topo_list=H_topo_list, H_geo_list=H_geo_list)
             
             if self.return_intermediate:
                 inter_class_logits.append(class_logits)
@@ -442,6 +444,8 @@ class RCNNHead(nn.Module):
         self.d_model = d_model
         self.withVTRAM = cfg.MODEL.RADM.withVTRAM
         self.withGRAM = cfg.MODEL.RADM.withGRAM
+        self.withRGCN = getattr(cfg.MODEL.RADM, 'withRGCN', False)
+        self.withEnhancedGeo = getattr(cfg.MODEL.RADM, 'WITH_ENHANCED_GEO', False)
         self.d_fused = d_model
         # dynamic.
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
@@ -456,9 +460,17 @@ class RCNNHead(nn.Module):
             self.vis_text_att = VisualTextualRelationAwareModule(d_model, d_model, 768, d_model, d_model, self.propose_num, 2, 0)
             self.linear4 = nn.Linear(4, d_model)
 
-        if self.withGRAM: 
+        if self.withGRAM:
             self.d_fused += topo_out_dim
             self.GRAM = GeometryRelationAwareModule(topo_in_dim=256*7*7, topo_out_dim=topo_out_dim)#256*7*7 RoIpooling output dimension
+
+        # Account for RGCN topology features (H_topo)
+        if self.withRGCN:
+            self.d_fused += d_model
+
+        # Account for enhanced geometry features (H_geo)
+        if self.withEnhancedGeo:
+            self.d_fused += d_model
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -503,12 +515,15 @@ class RCNNHead(nn.Module):
         self.scale_clamp = scale_clamp
         self.bbox_weights = bbox_weights
 
-    def forward(self, features, bboxes, norm_bboxes, txt_features, txt_mask, pro_features, pooler,  time_emb):
+    def forward(self, features, bboxes, norm_bboxes, txt_features, txt_mask, pro_features, pooler, time_emb,
+                H_topo_list=None, H_geo_list=None):
         """
         :param bboxes: (N, nr_boxes, 4)
         :param norm_bboxes: (N, nr_boxes, 4) [0,1]
         :param pro_features: (N, nr_boxes, d_model)
         :param gt_rois: (m, 5)[batch_ind, x1,y1,x2,y2]
+        :param H_topo_list: list of (nr_boxes, d_model) topology features from RGCN
+        :param H_geo_list: list of (nr_boxes, d_model) geometry-enhanced features
         """
         
         N, nr_boxes = bboxes.shape[:2]
@@ -568,9 +583,31 @@ class RCNNHead(nn.Module):
         fc_feature = fc_feature * (scale + 1) + shift
       
         if self.withVTRAM:
-            fc_feature = torch.cat((fc_feature, mm_fea), dim=1)       
+            fc_feature = torch.cat((fc_feature, mm_fea), dim=1)
         if self.withGRAM:
             fc_feature = torch.cat((top_features, fc_feature), dim=1)
+
+        # Incorporate topology features from RGCN (H_topo)
+        if H_topo_list is not None:
+            topo_feats = []
+            for b_idx, h_topo in enumerate(H_topo_list):
+                if h_topo is not None:
+                    topo_feats.append(h_topo)
+                else:
+                    topo_feats.append(torch.zeros(nr_boxes, self.d_model, device=fc_feature.device))
+            topo_cat = torch.cat(topo_feats, dim=0)  # (N * nr_boxes, d_model)
+            fc_feature = torch.cat((fc_feature, topo_cat), dim=1)
+
+        # Incorporate geometry-enhanced features (H_geo)
+        if H_geo_list is not None:
+            geo_feats = []
+            for b_idx, h_geo in enumerate(H_geo_list):
+                if h_geo is not None:
+                    geo_feats.append(h_geo)
+                else:
+                    geo_feats.append(torch.zeros(nr_boxes, self.d_model, device=fc_feature.device))
+            geo_cat = torch.cat(geo_feats, dim=0)  # (N * nr_boxes, d_model)
+            fc_feature = torch.cat((fc_feature, geo_cat), dim=1)
 
         
         

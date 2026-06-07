@@ -21,10 +21,22 @@ from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, detector_pos
 
 from detectron2.structures import Boxes, ImageList, Instances
 
-from .loss import SetCriterionDynamicK, HungarianMatcherDynamicK
+from .loss import SetCriterionDynamicK, HungarianMatcherDynamicK, GraphEncodingLoss, CombinedCriterion
 from .head import DynamicHead
 from .util.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 from .util.misc import nested_tensor_from_tensor_list
+from .rgcn import RGCN, RelationClassifier, GridPositionPredictor
+from .constraint_graph import ConstraintGraphBuilder
+from .geometry_relation import GeometryRelationModule
+from .layout_decoder import LayoutGenerationHead
+
+# Conditionally import visual encoder (requires dinov2)
+try:
+    from .visual_encoder import VisualPriorEncoder
+    HAS_VISUAL_ENCODER = True
+except ImportError:
+    HAS_VISUAL_ENCODER = False
+    print("Warning: VisualPriorEncoder not available. Install dinov2 for visual encoding.")
 
 __all__ = ["RADM"]
 
@@ -231,6 +243,96 @@ class RADM(nn.Module):
             cfg=cfg, num_classes=self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=no_object_weight,
             losses=losses, use_focal=self.use_focal,)
 
+        # ========================================
+        # New modules from paper requirements
+        # ========================================
+
+        # RGCN for constraint graph topological reasoning
+        self.use_rgcn = getattr(cfg.MODEL, 'RGCN', None) is not None and cfg.MODEL.RGCN.ENABLED
+        if self.use_rgcn:
+            self.rgcn = RGCN(
+                in_dim=self.hidden_dim,
+                hidden_dim=cfg.MODEL.RGCN.HIDDEN_DIM,
+                out_dim=self.hidden_dim,
+                num_relations=cfg.MODEL.RGCN.NUM_RELATIONS,
+                num_layers=cfg.MODEL.RGCN.NUM_LAYERS,
+                num_bases=cfg.MODEL.RGCN.NUM_BASES,
+                dropout=cfg.MODEL.RGCN.DROPOUT,
+            )
+
+            # Constraint graph builder
+            self.graph_builder = ConstraintGraphBuilder(
+                text_dim=768,
+                hidden_dim=self.hidden_dim,
+                num_classes=self.num_classes,
+                num_relations=cfg.MODEL.RGCN.NUM_RELATIONS,
+            )
+
+            # Relation classifier for auxiliary supervision
+            self.relation_classifier = RelationClassifier(
+                in_dim=self.hidden_dim,
+                num_rel_categories=8,
+            )
+
+            # Grid position predictor
+            self.grid_predictor = GridPositionPredictor(
+                in_dim=self.hidden_dim,
+                grid_size=cfg.MODEL.AUX_LOSS.GRID_SIZE,
+            )
+
+            # Graph encoding auxiliary loss
+            self.use_aux_loss = getattr(cfg.MODEL, 'AUX_LOSS', None) is not None
+            if self.use_aux_loss:
+                self.graph_loss = GraphEncodingLoss(
+                    lambda_rel=cfg.MODEL.AUX_LOSS.LAMBDA_REL,
+                    lambda_pos=cfg.MODEL.AUX_LOSS.LAMBDA_POS,
+                    grid_size=cfg.MODEL.AUX_LOSS.GRID_SIZE,
+                )
+                self.aux_use_relation = cfg.MODEL.AUX_LOSS.RELATION_RECONSTRUCT
+                self.aux_use_grid = cfg.MODEL.AUX_LOSS.GRID_POSITION
+            else:
+                self.aux_use_relation = False
+                self.aux_use_grid = False
+
+        # Enhanced Geometry Relation Module
+        self.use_geo_relation = getattr(cfg.MODEL, 'GEO_RELATION', None) is not None and cfg.MODEL.GEO_RELATION.ENABLED
+        if self.use_geo_relation:
+            self.geo_relation = GeometryRelationModule(
+                in_channels=self.hidden_dim,
+                embed_dim=cfg.MODEL.GEO_RELATION.EMBED_DIM,
+                fc_out_channels=cfg.MODEL.GEO_RELATION.FC_OUT_CHANNELS,
+                wave_length=cfg.MODEL.GEO_RELATION.WAVE_LENGTH,
+                out_dim=cfg.MODEL.GEO_RELATION.OUT_DIM,
+            )
+
+        # Layout Generation Head (Layout Encoder + Multi-Modal Decoder)
+        self.use_layout_decoder = getattr(cfg.MODEL, 'LAYOUT_DECODER', None) is not None and cfg.MODEL.LAYOUT_DECODER.ENABLED
+        if self.use_layout_decoder:
+            self.layout_gen_head = LayoutGenerationHead(
+                d_model=self.hidden_dim,
+                nhead=cfg.MODEL.LAYOUT_DECODER.MM_NUM_HEADS,
+                dropout=cfg.MODEL.LAYOUT_DECODER.MM_DROPOUT,
+                text_dim=cfg.MODEL.LAYOUT_DECODER.TEXT_DIM,
+                fourier_dim=cfg.MODEL.LAYOUT_DECODER.FOURIER_DIM,
+                fourier_scale=cfg.MODEL.LAYOUT_DECODER.FOURIER_SCALE,
+                fusion_mode=cfg.MODEL.LAYOUT_DECODER.FUSION_MODE,
+            )
+
+        # Visual Prior Encoder (DINO-ViT)
+        self.use_visual_encoder = (
+            getattr(cfg.MODEL, 'VISUAL_ENCODER', None) is not None and
+            cfg.MODEL.VISUAL_ENCODER.ENABLED and
+            HAS_VISUAL_ENCODER
+        )
+        if self.use_visual_encoder:
+            self.visual_encoder = VisualPriorEncoder(
+                model_name=cfg.MODEL.VISUAL_ENCODER.MODEL_NAME,
+                freeze_backbone=cfg.MODEL.VISUAL_ENCODER.FREEZE_BACKBONE,
+                feature_dim=cfg.MODEL.VISUAL_ENCODER.FEATURE_DIM,
+                out_channels=cfg.MODEL.VISUAL_ENCODER.OUT_CHANNELS,
+                roi_output_size=cfg.MODEL.VISUAL_ENCODER.ROI_OUTPUT_SIZE,
+            )
+
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
         pixel_std = torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
@@ -242,17 +344,18 @@ class RADM(nn.Module):
                 extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
-    def model_predictions(self, backbone_feats, images_whwh, x, text_feature, txt_mask, t, x_self_cond=None, clip_x_start=False):
+    def model_predictions(self, backbone_feats, images_whwh, x, text_feature, txt_mask, t, x_self_cond=None, clip_x_start=False, H_topo_list=None, H_geo_list=None):
         x_boxes = torch.clamp(x, min=-1 * self.scale, max=self.scale)
         x_boxes = ((x_boxes / self.scale) + 1) / 2
         x_boxes = box_cxcywh_to_xyxy(x_boxes)
         norm_boxes = x_boxes
         x_boxes = x_boxes * images_whwh[:, None, :]
         batch_num, n=x_boxes.shape[:2]
-        
+
         xxyy=x_boxes.reshape(-1,4) #[n,4]
-        
-        outputs_class, outputs_coord = self.head(backbone_feats, x_boxes, norm_boxes, text_feature, txt_mask, t, None)
+
+        outputs_class, outputs_coord = self.head(backbone_feats, x_boxes, norm_boxes, text_feature, txt_mask, t, None,
+                                                  H_topo_list=H_topo_list, H_geo_list=H_geo_list)
         
 
         x_start = outputs_coord[-1]  # (batch, num_proposals, 4) predict boxes: absolute coordinates (x1, y1, x2, y2)
@@ -285,8 +388,30 @@ class RADM(nn.Module):
             time_cond = torch.full((batch,), time, device=self.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
 
+            # Build constraint graph and compute topology/geometry features at inference time
+            H_topo_list = None
+            H_geo_list = None
+            if self.use_rgcn and time > 0:
+                curr_boxes_norm = torch.clamp(img, min=-1 * self.scale, max=self.scale)
+                curr_boxes_norm = ((curr_boxes_norm / self.scale) + 1) / 2
+
+                H_topo_list = []
+                H_geo_list = []
+                for b_idx in range(batch):
+                    boxes_b = curr_boxes_norm[b_idx]
+                    class_ids_b = torch.ones(boxes_b.size(0), device=self.device, dtype=torch.long)
+                    txt_feat_b = text_feature[b_idx, :boxes_b.size(0), :]
+                    node_feat, adj_mats, _ = self.graph_builder(txt_feat_b, boxes_b, class_ids_b)
+                    H_topo_b = self.rgcn(node_feat, adj_mats)
+                    H_topo_list.append(H_topo_b)
+
+                    if self.use_geo_relation:
+                        H_geo_b = self.geo_relation(H_topo_b, boxes_b)
+                        H_geo_list.append(H_geo_b)
+
             preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, text_feature, txt_mask, time_cond,
-                                                                         self_cond, clip_x_start=clip_denoised)
+                                                                         self_cond, clip_x_start=clip_denoised,
+                                                                         H_topo_list=H_topo_list, H_geo_list=H_geo_list)
             pred_noise, x_start = preds.pred_noise, preds.pred_x_start
 
             if self.box_renewal:  # filter
@@ -409,19 +534,16 @@ class RADM(nn.Module):
             return results
 
         if self.training:
-            
+
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            
+
             targets, x_boxes, noises, t = self.prepare_targets(gt_instances)
-            #print(images_cwh)
             t = t.squeeze(-1)
-            #print(x_boxes)
             norm_x_boxes = x_boxes.to(torch.float32)
-            #norm_x_boxes = torch.clamp(norm_x_boxes, min=0, max=1)
             x_boxes = x_boxes * images_whwh[:, None, :]
-            
+
             outputs_class, outputs_coord = self.head(features, x_boxes, norm_x_boxes, text_features,  txt_mask, t, None)
-            
+
             output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
 
             if self.deep_supervision:
@@ -433,6 +555,35 @@ class RADM(nn.Module):
             for k in loss_dict.keys():
                 if k in weight_dict:
                     loss_dict[k] *= weight_dict[k]
+
+            # Compute graph encoding auxiliary losses
+            if self.use_rgcn:
+                # Prepare graph targets
+                graph_data = self.prepare_graph_targets(gt_instances, images_whwh)
+
+                # Collect boxes and class ids
+                boxes_list = []
+                class_ids_list = []
+                for gd in graph_data:
+                    if gd is not None:
+                        boxes_list.append(gd['boxes'])
+                        class_ids_list.append(gd['classes'])
+                    else:
+                        boxes_list.append(torch.zeros(0, 4, device=self.device))
+                        class_ids_list.append(torch.zeros(0, device=self.device, dtype=torch.long))
+
+                # Compute graph encoding
+                H_topo_list, graph_outputs = self.compute_graph_encoding(
+                    text_features, boxes_list, class_ids_list
+                )
+
+                # Compute auxiliary losses
+                if self.use_aux_loss:
+                    graph_loss, graph_loss_dict = self.compute_graph_aux_losses(
+                        graph_outputs, boxes_list
+                    )
+                    loss_dict.update(graph_loss_dict)
+
             return loss_dict
 
     def prepare_diffusion_repeat(self, gt_boxes):
@@ -537,6 +688,150 @@ class RADM(nn.Module):
             new_targets.append(target)
 
         return new_targets, torch.stack(diffused_boxes), torch.stack(noises), torch.stack(ts)
+
+    def prepare_graph_targets(self, gt_instances, images_whwh):
+        """
+        Prepare graph construction targets from ground-truth instances.
+
+        Args:
+            gt_instances: list of per-image Instances
+            images_whwh: (B, 4) image dimensions
+
+        Returns:
+            graph_data: list of per-image graph dicts
+        """
+        graph_data = []
+        for i, gt in enumerate(gt_instances):
+            w, h = images_whwh[i, 0], images_whwh[i, 1]
+            image_size = torch.as_tensor([w, h, w, h], device=self.device)
+
+            # Get ground-truth boxes and classes
+            gt_boxes_abs = gt.gt_boxes.tensor  # (N_gt, 4) absolute xyxy
+            if gt_boxes_abs.numel() == 0:
+                graph_data.append(None)
+                continue
+
+            gt_boxes_norm = gt_boxes_abs / image_size  # Normalize
+            gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)  # (cx, cy, w, h)
+            gt_classes = gt.gt_classes  # (N_gt,)
+
+            graph_data.append({
+                'boxes': gt_boxes_cxcywh,
+                'classes': gt_classes,
+                'boxes_abs': gt_boxes_abs,
+            })
+
+        return graph_data
+
+    def compute_graph_encoding(self, text_features, boxes_list, class_ids_list):
+        """
+        Build constraint graph and run RGCN encoding.
+
+        Args:
+            text_features: (B, N_txt, text_dim) text features
+            boxes_list: list of per-image (N_i, 4) boxes
+            class_ids_list: list of per-image (N_i,) class ids
+
+        Returns:
+            H_topo_list: list of per-image (N_i, hidden_dim) topology features
+            graph_losses: dict of auxiliary losses (if training)
+        """
+        H_topo_list = []
+        all_edge_labels = []
+        all_adj_mats = []
+        all_node_features = []
+
+        for i, (boxes, class_ids) in enumerate(zip(boxes_list, class_ids_list)):
+            if boxes is None or boxes.numel() == 0:
+                H_topo_list.append(None)
+                continue
+
+            N = boxes.size(0)
+
+            # Get text features for this image's elements
+            # Use first N text features
+            txt_feat = text_features[i, :N, :]  # (N, text_dim)
+
+            # Build constraint graph
+            node_feat, adj_mats, edge_labels = self.graph_builder(
+                txt_feat, boxes, class_ids
+            )
+
+            # RGCN message passing
+            H_topo = self.rgcn(node_feat, adj_mats)  # (N, hidden_dim)
+
+            H_topo_list.append(H_topo)
+            all_edge_labels.append(edge_labels)
+            all_adj_mats.append(adj_mats)
+            all_node_features.append(node_feat)
+
+        return H_topo_list, {
+            'edge_labels': all_edge_labels,
+            'adj_mats': all_adj_mats,
+            'node_features': all_node_features,
+            'H_topo': H_topo_list,
+        }
+
+    def compute_graph_aux_losses(self, graph_outputs, boxes_list):
+        """
+        Compute auxiliary graph encoding losses.
+
+        Args:
+            graph_outputs: dict from compute_graph_encoding
+            boxes_list: list of per-image boxes
+
+        Returns:
+            total_graph_loss: scalar
+            loss_dict: dict of individual losses
+        """
+        total_loss = torch.tensor(0.0, device=self.device)
+        loss_dict = {}
+
+        for i, (H_topo, edge_labels, adj_mats, boxes) in enumerate(zip(
+            graph_outputs['H_topo'],
+            graph_outputs['edge_labels'],
+            graph_outputs['adj_mats'],
+            boxes_list,
+        )):
+            if H_topo is None:
+                continue
+
+            # Relation reconstruction loss
+            if self.use_aux_loss and self.aux_use_relation:
+                # Predict relation labels from node pairs
+                N = H_topo.size(0)
+                h_i = H_topo.unsqueeze(1).expand(N, N, -1)
+                h_j = H_topo.unsqueeze(0).expand(N, N, -1)
+                pred_rel = self.relation_classifier(
+                    h_i.reshape(-1, self.hidden_dim),
+                    h_j.reshape(-1, self.hidden_dim)
+                ).reshape(N, N, -1)
+
+                edge_mask = adj_mats.sum(0) > 0
+                edge_mask = edge_mask - torch.eye(N, device=self.device).bool()
+                edge_mask = edge_mask.clamp(min=0).bool()
+
+                if edge_mask.sum() > 0:
+                    pred_flat = pred_rel[edge_mask]
+                    labels_flat = edge_labels[edge_mask].long().clamp(0, 7)
+                    L_rel = F.cross_entropy(pred_flat, labels_flat)
+                    total_loss = total_loss + self.graph_loss.lambda_rel * L_rel
+                    loss_dict['loss_relation_reconstruct'] = L_rel
+
+            # Grid position loss
+            if self.use_aux_loss and self.aux_use_grid:
+                pred_grid = self.grid_predictor(H_topo)
+                gt_grid = self.grid_predictor.get_grid_labels(
+                    boxes[:, :2].clamp(0, 1)
+                )
+                L_pos = F.cross_entropy(pred_grid, gt_grid)
+                total_loss = total_loss + self.graph_loss.lambda_pos * L_pos
+                loss_dict['loss_grid_position'] = L_pos
+
+        if total_loss > 0:
+            loss_dict['loss_graph_encoding'] = total_loss
+
+        return total_loss, loss_dict
 
     def inference(self, box_cls, box_pred, image_sizes):
         """

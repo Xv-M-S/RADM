@@ -451,3 +451,216 @@ class HungarianMatcherDynamicK(nn.Module):
         matched_query_id = torch.min(cost, dim=0)[1]
 
         return (selected_query, gt_indices), matched_query_id
+
+
+# ========================================
+# Auxiliary Graph Encoding Losses
+# - Relation Reconstruction Loss L_rel
+# - Grid Position Classification Loss L_pos
+# ========================================
+
+class GraphEncodingLoss(nn.Module):
+    """
+    Auxiliary supervision losses for graph encoding stage.
+
+    Combines:
+      - Relation reconstruction loss L_rel:
+          Predict relative position category from node pair features
+      - Grid position classification loss L_pos:
+          Predict grid index from node features
+
+    Total: L_enc = λ_rel * L_rel + λ_pos * L_pos
+    """
+
+    def __init__(self, lambda_rel=1.0, lambda_pos=1.0, grid_size=8,
+                 num_rel_labels=8):
+        super().__init__()
+        self.lambda_rel = lambda_rel
+        self.lambda_pos = lambda_pos
+        self.grid_size = grid_size
+        self.num_rel_labels = num_rel_labels
+
+        self.ce_loss = nn.CrossEntropyLoss()
+
+    def relation_reconstruction_loss(self, H_topo, edge_labels, adj_mats):
+        """
+        Compute relation reconstruction loss L_rel.
+
+        L_rel = -1/|E| Σ_{(i,j)∈E} Σ_{c=1}^{N_rel} y_{ij,c} log(ŷ_{ij,c})
+
+        Args:
+            H_topo: (N, D) final node representations from RGCN
+            edge_labels: (N, N) ground-truth relative position labels
+            adj_mats: (num_relations, N, N) adjacency matrices
+
+        Returns:
+            L_rel: scalar loss
+        """
+        N = H_topo.size(0)
+        device = H_topo.device
+
+        # Only compute loss for edges that exist
+        edge_mask = (adj_mats.sum(0) > 0).float()  # (N, N)
+        edge_mask = edge_mask - torch.eye(N, device=device)  # Remove self-loops
+        edge_mask = edge_mask.clamp(min=0)
+
+        num_edges = edge_mask.sum()
+        if num_edges == 0:
+            return torch.tensor(0.0, device=device)
+
+        # Build pair features: [h_i, h_j, h_i * h_j]
+        h_i = H_topo.unsqueeze(1).expand(N, N, -1)  # (N, N, D)
+        h_j = H_topo.unsqueeze(0).expand(N, N, -1)  # (N, N, D)
+        pair_feat = torch.cat([h_i, h_j, h_i * h_j], dim=-1)  # (N, N, 3D)
+
+        # Simple relation classifier
+        relation_classifier = nn.Sequential(
+            nn.Linear(H_topo.size(-1) * 3, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self.num_rel_labels),
+        ).to(device)
+
+        # Predict
+        pred = relation_classifier(pair_feat)  # (N, N, num_rel_labels)
+
+        # Flatten and mask
+        pred_flat = pred.reshape(-1, self.num_rel_labels)
+        labels_flat = edge_labels.reshape(-1).long()
+        mask_flat = edge_mask.reshape(-1).bool()
+
+        if mask_flat.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        loss = self.ce_loss(
+            pred_flat[mask_flat], labels_flat[mask_flat].clamp(0, self.num_rel_labels - 1)
+        )
+
+        return loss
+
+    def grid_position_loss(self, H_topo, boxes, grid_size=None):
+        """
+        Compute grid position classification loss L_pos.
+
+        L_pos = -1/|V| Σ_{i∈V} Σ_{k=1}^{S^2} I(t_i = k) * log(p̂_{i,k})
+
+        Args:
+            H_topo: (N, D) node features
+            boxes: (N, 4) normalized bounding boxes (cx, cy, w, h)
+            grid_size: S for S×S grid (default: self.grid_size)
+
+        Returns:
+            L_pos: scalar loss
+        """
+        if grid_size is None:
+            grid_size = self.grid_size
+
+        N = H_topo.size(0)
+        device = H_topo.device
+        num_cells = grid_size * grid_size
+
+        # Grid position predictor
+        grid_predictor = nn.Sequential(
+            nn.Linear(H_topo.size(-1), 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_cells),
+        ).to(device)
+
+        # Predict grid indices
+        pred = grid_predictor(H_topo)  # (N, num_cells)
+
+        # Compute ground-truth grid labels from box centers
+        cx = boxes[:, 0].clamp(0.0, 1.0 - 1e-6)
+        cy = boxes[:, 1].clamp(0.0, 1.0 - 1e-6)
+
+        cell_x = (cx * grid_size).long().clamp(0, grid_size - 1)
+        cell_y = (cy * grid_size).long().clamp(0, grid_size - 1)
+        gt_labels = cell_y * grid_size + cell_x  # (N,)
+
+        loss = self.ce_loss(pred, gt_labels)
+
+        return loss
+
+    def forward(self, H_topo, edge_labels, adj_mats, boxes):
+        """
+        Compute total graph encoding loss.
+
+        Args:
+            H_topo: (N, D) final node representations from RGCN
+            edge_labels: (N, N) relative position labels
+            adj_mats: (num_relations, N, N) adjacency matrices
+            boxes: (N, 4) normalized bounding boxes
+
+        Returns:
+            total_loss: scalar
+            loss_dict: dict with individual losses
+        """
+        L_rel = self.relation_reconstruction_loss(H_topo, edge_labels, adj_mats)
+        L_pos = self.grid_position_loss(H_topo, boxes)
+
+        total_loss = self.lambda_rel * L_rel + self.lambda_pos * L_pos
+
+        loss_dict = {
+            'loss_relation_reconstruct': L_rel,
+            'loss_grid_position': L_pos,
+            'loss_graph_encoding': total_loss,
+        }
+
+        return total_loss, loss_dict
+
+
+class CombinedCriterion(nn.Module):
+    """
+    Combined criterion that includes both detection losses and
+    auxiliary graph encoding losses.
+    """
+
+    def __init__(self, detection_criterion, graph_loss, lambda_det=1.0,
+                 lambda_graph=1.0):
+        super().__init__()
+        self.detection_criterion = detection_criterion
+        self.graph_loss = graph_loss
+        self.lambda_det = lambda_det
+        self.lambda_graph = lambda_graph
+
+    def forward(self, outputs, targets, graph_outputs=None):
+        """
+        Args:
+            outputs: dict from model (pred_logits, pred_boxes, etc.)
+            targets: list of target dicts
+            graph_outputs: optional dict with graph encoding outputs
+                          (H_topo, edge_labels, adj_mats, boxes)
+
+        Returns:
+            Combined loss dict
+        """
+        # Detection losses
+        det_losses = self.detection_criterion(outputs, targets)
+        total_loss = {}
+        total_loss.update({k: v * self.lambda_det for k, v in det_losses.items()})
+
+        # Graph encoding losses
+        if graph_outputs is not None:
+            graph_loss_val, graph_loss_dict = self.graph_loss(
+                graph_outputs['H_topo'],
+                graph_outputs['edge_labels'],
+                graph_outputs['adj_mats'],
+                graph_outputs['boxes'],
+            )
+            total_loss.update({
+                k: v * self.lambda_graph for k, v in graph_loss_dict.items()
+            })
+
+        return total_loss
+
+
+def build_graph_encoding_loss(cfg):
+    """Factory function to build graph encoding loss from config."""
+    lambda_rel = cfg.MODEL.AUX_LOSS.LAMBDA_REL
+    lambda_pos = cfg.MODEL.AUX_LOSS.LAMBDA_POS
+    grid_size = cfg.MODEL.AUX_LOSS.GRID_SIZE
+
+    return GraphEncodingLoss(
+        lambda_rel=lambda_rel,
+        lambda_pos=lambda_pos,
+        grid_size=grid_size,
+    )
