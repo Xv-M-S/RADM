@@ -217,9 +217,9 @@ if __name__ == "__main__":
     
     test_imgdir: 
     '''
-    test_imgdir = '/home/lifengheng6/RADM_dataset/images/test'
-    test_label = '/home/lifengheng6/RADM_dataset/annotations/test.json'
-    test_annotation = '/home/lifengheng6/outputs_notebook2/inference/coco_instances_results.json'
+    test_imgdir = '/home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/dataSets/dataSets/RADM_dataset/images/test'
+    test_label = '/home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/dataSets/dataSets/RADM_dataset/annotations/test.json'
+    test_annotation = '/home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/output/inference/coco_instances_results.json'
     vis_example = './vis_example/'
     main(test_label, test_annotation, test_imgdir, vis_example)
     

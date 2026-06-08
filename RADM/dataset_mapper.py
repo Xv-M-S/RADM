@@ -91,7 +91,7 @@ class RADMDatasetMapper:
             )
         
         if os.path.exists(fea_path):
-            text_fea = torch.load(fea_path)
+            text_fea = torch.load(fea_path, weights_only=False)
             text_num = len(text_fea['feats'])
             text_mask = torch.full((text_num,1), False)
             padding = torch.full((max_text_num - text_num, 1), True)

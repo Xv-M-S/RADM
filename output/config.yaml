@@ -7,14 +7,14 @@ DATALOADER:
   REPEAT_THRESHOLD: 0.0
   SAMPLER_TRAIN: TrainingSampler
 DATASETS:
-  DATASET_PATH: ${yourPath}/DatasetRoot
+  DATASET_PATH: /home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/dataSets/dataSets/RADM_dataset
   PRECOMPUTED_PROPOSAL_TOPK_TEST: 1000
   PRECOMPUTED_PROPOSAL_TOPK_TRAIN: 2000
   PROPOSAL_FILES_TEST: []
   PROPOSAL_FILES_TRAIN: []
   TEST:
   - layout_val
-  TEXT_FEATURE_PATH: ${yourPath}/DatasetRoot/text_features
+  TEXT_FEATURE_PATH: /home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/dataSets/dataSets/RADM_dataset/text_features
   TRAIN:
   - layout_train
 FLOAT32_PRECISION: ''

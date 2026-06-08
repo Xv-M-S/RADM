@@ -398,9 +398,20 @@ class RADM(nn.Module):
                 H_topo_list = []
                 H_geo_list = []
                 for b_idx in range(batch):
-                    boxes_b = curr_boxes_norm[b_idx]
+                    boxes_b = curr_boxes_norm[b_idx]  # (num_proposals, 4)
                     class_ids_b = torch.ones(boxes_b.size(0), device=self.device, dtype=torch.long)
-                    txt_feat_b = text_feature[b_idx, :boxes_b.size(0), :]
+
+                    # Get text features from batched_inputs (per-image)
+                    text_fea = batched_inputs[b_idx]["text_fea"]['feats'].to(self.device)  # (max_text, 768)
+                    N_txt = text_fea.size(0)
+                    N_prop = boxes_b.size(0)
+                    if N_prop > N_txt:
+                        # Pad text features with zeros if fewer than num_proposals
+                        pad = torch.zeros(N_prop - N_txt, 768, device=self.device)
+                        txt_feat_b = torch.cat([text_fea, pad], dim=0)
+                    else:
+                        txt_feat_b = text_fea[:N_prop]
+
                     node_feat, adj_mats, _ = self.graph_builder(txt_feat_b, boxes_b, class_ids_b)
                     H_topo_b = self.rgcn(node_feat, adj_mats)
                     H_topo_list.append(H_topo_b)
@@ -574,7 +585,7 @@ class RADM(nn.Module):
 
                 # Compute graph encoding
                 H_topo_list, graph_outputs = self.compute_graph_encoding(
-                    text_features, boxes_list, class_ids_list
+                    batched_inputs, boxes_list, class_ids_list
                 )
 
                 # Compute auxiliary losses
@@ -723,18 +734,18 @@ class RADM(nn.Module):
 
         return graph_data
 
-    def compute_graph_encoding(self, text_features, boxes_list, class_ids_list):
+    def compute_graph_encoding(self, batched_inputs, boxes_list, class_ids_list):
         """
         Build constraint graph and run RGCN encoding.
 
         Args:
-            text_features: (B, N_txt, text_dim) text features
-            boxes_list: list of per-image (N_i, 4) boxes
+            batched_inputs: list of per-image dataset dicts (has 'text_fea')
+            boxes_list: list of per-image (N_i, 4) boxes (cx, cy, w, h normalized)
             class_ids_list: list of per-image (N_i,) class ids
 
         Returns:
             H_topo_list: list of per-image (N_i, hidden_dim) topology features
-            graph_losses: dict of auxiliary losses (if training)
+            graph_data: dict of intermediate outputs for loss computation
         """
         H_topo_list = []
         all_edge_labels = []
@@ -748,9 +759,10 @@ class RADM(nn.Module):
 
             N = boxes.size(0)
 
-            # Get text features for this image's elements
-            # Use first N text features
-            txt_feat = text_features[i, :N, :]  # (N, text_dim)
+            # Get text features for this image from batched_inputs
+            text_fea = batched_inputs[i]["text_fea"]['feats'].to(self.device)  # (max_text, 768)
+            # Use first N text features (each GT box corresponds to one text element)
+            txt_feat = text_fea[:N].to(self.device)  # (N, 768)
 
             # Build constraint graph
             node_feat, adj_mats, edge_labels = self.graph_builder(
@@ -808,8 +820,8 @@ class RADM(nn.Module):
                 ).reshape(N, N, -1)
 
                 edge_mask = adj_mats.sum(0) > 0
-                edge_mask = edge_mask - torch.eye(N, device=self.device).bool()
-                edge_mask = edge_mask.clamp(min=0).bool()
+                eye_mask = torch.eye(N, device=self.device).bool()
+                edge_mask = edge_mask & (~eye_mask)  # remove self-loops
 
                 if edge_mask.sum() > 0:
                     pred_flat = pred_rel[edge_mask]

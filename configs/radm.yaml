@@ -13,8 +13,8 @@ MODEL:
     NMS_THRESH: 0.15
     CLASS_THRESH: 0.25
 DATASETS:
-  TEXT_FEATURE_PATH: '${yourPath}/DatasetRoot/text_features'
-  DATASET_PATH: '${yourPath}/DatasetRoot'
+  TEXT_FEATURE_PATH: '/home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/dataSets/dataSets/RADM_dataset/text_features'
+  DATASET_PATH: '/home/sxm/data02Space/GraduationProject/textToLayoutBaseRADM/RADM/dataSets/dataSets/RADM_dataset'
   TRAIN: ("layout_train",)
   TEST:  ("layout_val",)
 SOLVER:

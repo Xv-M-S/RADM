@@ -588,25 +588,33 @@ class RCNNHead(nn.Module):
             fc_feature = torch.cat((top_features, fc_feature), dim=1)
 
         # Incorporate topology features from RGCN (H_topo)
-        if H_topo_list is not None:
-            topo_feats = []
-            for b_idx, h_topo in enumerate(H_topo_list):
-                if h_topo is not None:
-                    topo_feats.append(h_topo)
-                else:
-                    topo_feats.append(torch.zeros(nr_boxes, self.d_model, device=fc_feature.device))
-            topo_cat = torch.cat(topo_feats, dim=0)  # (N * nr_boxes, d_model)
+        # Always concat (with zeros if not available) to keep d_fused consistent
+        if self.withRGCN:
+            if H_topo_list is not None:
+                topo_feats = []
+                for b_idx, h_topo in enumerate(H_topo_list):
+                    if h_topo is not None:
+                        topo_feats.append(h_topo)
+                    else:
+                        topo_feats.append(torch.zeros(nr_boxes, self.d_model, device=fc_feature.device))
+                topo_cat = torch.cat(topo_feats, dim=0)
+            else:
+                topo_cat = torch.zeros(N * nr_boxes, self.d_model, device=fc_feature.device)
             fc_feature = torch.cat((fc_feature, topo_cat), dim=1)
 
         # Incorporate geometry-enhanced features (H_geo)
-        if H_geo_list is not None:
-            geo_feats = []
-            for b_idx, h_geo in enumerate(H_geo_list):
-                if h_geo is not None:
-                    geo_feats.append(h_geo)
-                else:
-                    geo_feats.append(torch.zeros(nr_boxes, self.d_model, device=fc_feature.device))
-            geo_cat = torch.cat(geo_feats, dim=0)  # (N * nr_boxes, d_model)
+        # Always concat (with zeros if not available) to keep d_fused consistent
+        if self.withEnhancedGeo:
+            if H_geo_list is not None:
+                geo_feats = []
+                for b_idx, h_geo in enumerate(H_geo_list):
+                    if h_geo is not None:
+                        geo_feats.append(h_geo)
+                    else:
+                        geo_feats.append(torch.zeros(nr_boxes, self.d_model, device=fc_feature.device))
+                geo_cat = torch.cat(geo_feats, dim=0)
+            else:
+                geo_cat = torch.zeros(N * nr_boxes, self.d_model, device=fc_feature.device)
             fc_feature = torch.cat((fc_feature, geo_cat), dim=1)
 
         
